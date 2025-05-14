@@ -55,7 +55,9 @@ import {
   collection, 
   getDocs, 
   doc, 
-  onSnapshot 
+  onSnapshot,
+  query,
+  where 
 } from "firebase/firestore";
 
 // Your web app's Firebase configuration
@@ -84,7 +86,14 @@ const db = getFirestore(app);
  */
 export function listenForRooms(callback) {
   const roomsCollection = collection(db, 'rooms');
-  return onSnapshot(roomsCollection, (snapshot) => {
+  // Dodanie warunków filtrowania - tylko aktywne pokoje bez zwycięzcy
+  const q = query(
+    roomsCollection, 
+    where("isActive", "==", true),
+    where("winner", "==", null)
+  );
+  
+  return onSnapshot(q, (snapshot) => {
     const roomsData = snapshot.docs.map(doc => {
       const data = doc.data();
       return {
@@ -125,7 +134,9 @@ export function listenForRoom(roomId, callback) {
         pool: roomData.entryFee * roomData.players.length,
         gameStarted: roomData.gameStarted,
         winner: roomData.winner,
-        createdAt: roomData.createdAt
+        createdAt: roomData.createdAt,
+        isActive: roomData.isActive === true, // Jawne porównanie
+        endedAt: roomData.endedAt
       });
     }
   }, (error) => {
@@ -160,6 +171,7 @@ export function listenForGameState(roomId, playerAddress, callback) {
             playersCount: roomData.players.length,
             direction: gameState.direction,
             deckSize: gameState.deck.length,
+            turnStartTime: gameState.turnStartTime, // Pole zawierające timestamp początku tury
             otherPlayersCardCount: roomData.players.reduce((acc, addr) => {
               if (addr !== playerAddress) {
                 acc[addr] = (gameState.playerHands[addr] || []).length;
@@ -167,7 +179,8 @@ export function listenForGameState(roomId, playerAddress, callback) {
               return acc;
             }, {}),
             lastAction: gameState.lastAction,
-            winner: roomData.winner
+            winner: roomData.winner,
+            isActive: roomData.isActive === true // Jawne porównanie
           };
           
           callback(playerState);

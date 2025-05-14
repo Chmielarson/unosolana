@@ -96,7 +96,12 @@ export async function getRooms() {
   console.log("Getting rooms list");
   try {
     const roomsCollection = collection(db, 'rooms');
-    const roomsQuery = query(roomsCollection, where("isActive", "!=", false)); // Pokaż tylko aktywne pokoje
+    // Zmiana zapytania - pobieramy tylko aktywne pokoje bez zwycięzcy
+    const roomsQuery = query(
+      roomsCollection, 
+      where("isActive", "==", true),
+      where("winner", "==", null)
+    );
     const roomsSnapshot = await getDocs(roomsQuery);
     
     console.log("Rooms found:", roomsSnapshot.docs.length);
@@ -349,7 +354,9 @@ export async function leaveGame(roomId, wallet) {
       // Ustaw przeciwnika jako zwycięzcę
       await updateDoc(roomRef, {
         winner: opponentAddress,
-        endReason: 'player_left'
+        endReason: 'player_left',
+        isActive: false,
+        endedAt: new Date().toISOString()
       });
       
       // Zaktualizuj stan gry
@@ -515,7 +522,8 @@ export async function getRoomInfo(roomId) {
       gameStarted: roomData.gameStarted,
       winner: roomData.winner,
       createdAt: roomData.createdAt,
-      isActive: roomData.isActive !== false
+      isActive: roomData.isActive === true, // Jawne porównanie, aby uniknąć wartości undefined
+      endedAt: roomData.endedAt
     };
   } catch (error) {
     console.error('Error getting room info:', error);
@@ -682,9 +690,11 @@ export async function playCard(roomId, cardIndex, chosenColor = null, wallet) {
     
     // Sprawdź, czy gracz wygrał
     if (playerHand.length === 0) {
-      // Aktualizuj pokój - ustaw zwycięzcę
+      // Aktualizuj pokój - ustaw zwycięzcę i oznacz jako nieaktywny
       await updateDoc(roomRef, {
-        winner: playerAddress
+        winner: playerAddress,
+        isActive: false,
+        endedAt: new Date().toISOString()
       });
       
       gameStateUpdate.lastAction.result = 'win';

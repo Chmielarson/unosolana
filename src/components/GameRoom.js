@@ -3,6 +3,20 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { joinRoom, getRoomInfo, getGameState, playCard, drawCard, claimPrize, leaveGame, autoSkipTurn } from '../utils/SolanaTransactions';
 import { listenForRoom, listenForGameState } from '../firebase';
+import { doc, getDoc } from 'firebase/firestore';
+import { db } from '../firebase';
+
+// Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
+const calculateRemainingTime = (turnStartTime, maxTurnTime) => {
+  if (!turnStartTime) return maxTurnTime;
+  
+  const startTime = new Date(turnStartTime).getTime();
+  const now = Date.now();
+  const elapsedSeconds = Math.floor((now - startTime) / 1000);
+  const remainingTime = Math.max(0, maxTurnTime - elapsedSeconds);
+  
+  return remainingTime;
+};
 
 function GameRoom({ roomId, onBack }) {
   const wallet = useWallet();
@@ -209,19 +223,7 @@ function GameRoom({ roomId, onBack }) {
       if (unsubGameState) unsubGameState();
     };
   }, [roomId, publicKey, wallet, gameStatus, isLoading]);
-  
-  // Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
-  const calculateRemainingTime = (turnStartTime) => {
-    if (!turnStartTime) return maxTurnTime;
-    
-    const startTime = new Date(turnStartTime).getTime();
-    const now = Date.now();
-    const elapsedSeconds = Math.floor((now - startTime) / 1000);
-    const remainingTime = Math.max(0, maxTurnTime - elapsedSeconds);
-    
-    return remainingTime;
-  };
-  
+
   // Efekt do odliczania czasu dla aktualnego gracza
   useEffect(() => {
     // Uruchamiamy timer tylko gdy jest nasza kolej i gra jest w toku
@@ -234,12 +236,21 @@ function GameRoom({ roomId, onBack }) {
       return;
     }
     
-    console.log("Starting turn timer");
+    console.log("Starting turn timer with turnStartTime:", gameState?.turnStartTime);
     
-    // Ustaw początkowy czas na podstawie turnStartTime jeśli istnieje
+    // Ustaw początkowy czas na podstawie turnStartTime z serwera
     if (gameState?.turnStartTime) {
-      const remainingTime = calculateRemainingTime(gameState.turnStartTime);
+      const remainingTime = calculateRemainingTime(gameState.turnStartTime, maxTurnTime);
       setTurnTimer(remainingTime);
+      
+      // Jeśli czas już minął, automatycznie dobierz kartę
+      if (remainingTime <= 0) {
+        console.log("Time's up! Auto-drawing card");
+        handleDrawCard().catch(error => {
+          console.error("Error auto-drawing card:", error);
+        });
+        return;
+      }
     } else {
       setTurnTimer(maxTurnTime);
     }
@@ -247,19 +258,36 @@ function GameRoom({ roomId, onBack }) {
     // Rozpocznij odliczanie
     const interval = setInterval(() => {
       setTurnTimer(prevTime => {
-        const newTime = prevTime - 1;
-        
-        // Gdy czas się skończy, automatycznie dobierz kartę
-        if (newTime <= 0) {
-          clearInterval(interval);
-          console.log("Time's up! Auto-drawing card");
-          handleDrawCard().catch(error => {
-            console.error("Error auto-drawing card:", error);
-          });
-          return 0;
+        // Upewnij się, że bazujemy na aktualnym czasie serwerowym
+        if (gameState?.turnStartTime) {
+          const currentRemaining = calculateRemainingTime(gameState.turnStartTime, maxTurnTime);
+          
+          // Gdy czas się skończy, automatycznie dobierz kartę
+          if (currentRemaining <= 0) {
+            clearInterval(interval);
+            console.log("Time's up! Auto-drawing card");
+            handleDrawCard().catch(error => {
+              console.error("Error auto-drawing card:", error);
+            });
+            return 0;
+          }
+          
+          return currentRemaining;
+        } else {
+          const newTime = prevTime - 1;
+          
+          // Gdy czas się skończy, automatycznie dobierz kartę
+          if (newTime <= 0) {
+            clearInterval(interval);
+            console.log("Time's up! Auto-drawing card");
+            handleDrawCard().catch(error => {
+              console.error("Error auto-drawing card:", error);
+            });
+            return 0;
+          }
+          
+          return newTime;
         }
-        
-        return newTime;
       });
     }, 1000);
     
@@ -282,16 +310,23 @@ function GameRoom({ roomId, onBack }) {
     
     if (!gameState?.turnStartTime) return;
     
-    console.log("Monitoring opponent's turn time");
+    console.log("Monitoring opponent's turn time with turnStartTime:", gameState.turnStartTime);
     
-    const remainingTime = calculateRemainingTime(gameState.turnStartTime);
-    if (remainingTime > 0) {
-      setTurnTimer(remainingTime);
+    const remainingTime = calculateRemainingTime(gameState.turnStartTime, maxTurnTime);
+    setTurnTimer(remainingTime);
+    
+    // Jeśli przeciwnik już przekroczył czas, spróbuj odświeżyć stan gry
+    if (remainingTime <= 0) {
+      console.log("Opponent time's up! Force refreshing game state");
+      loadRoomAndGameInfo(true).catch(error => {
+        console.error("Error refreshing game state:", error);
+      });
+      return;
     }
     
     // Sprawdzaj co sekundę, czy przeciwnik nie przekroczył czasu
     const interval = setInterval(async () => {
-      const currentRemaining = calculateRemainingTime(gameState.turnStartTime);
+      const currentRemaining = calculateRemainingTime(gameState.turnStartTime, maxTurnTime);
       
       setTurnTimer(currentRemaining);
       
@@ -315,7 +350,63 @@ function GameRoom({ roomId, onBack }) {
     }, 1000);
     
     return () => clearInterval(interval);
-  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo]);
+  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo, maxTurnTime]);
+  
+  // Efekt do automatycznego pominięcia nieaktywnego gracza
+  useEffect(() => {
+    // Uruchamiamy tylko gdy gra jest aktywna
+    if (gameStatus !== 'playing' || !roomId || !wallet || !publicKey) return;
+    
+    const syncAutoSkip = async () => {
+      try {
+        // Pobierz aktualny stan gry bezpośrednio z bazy
+        const gameStateRef = doc(db, 'gameStates', roomId);
+        const gameStateSnap = await getDoc(gameStateRef);
+        
+        if (!gameStateSnap.exists()) return;
+        
+        const serverGameState = gameStateSnap.data();
+        const roomRef = doc(db, 'rooms', roomId);
+        const roomSnap = await getDoc(roomRef);
+        
+        if (!roomSnap.exists()) return;
+        
+        const roomData = roomSnap.data();
+        
+        // Sprawdź, czy czas na ruch się skończył
+        if (serverGameState.turnStartTime) {
+          const remainingTime = calculateRemainingTime(serverGameState.turnStartTime, maxTurnTime);
+          
+          // Jeśli przekroczono czas o ponad 5 sekund i nadal jest ten sam gracz
+          if (remainingTime <= -5) {
+            const currentPlayerAddress = roomData.players[serverGameState.currentPlayerIndex];
+            console.log("Turn time exceeded by more than 5 seconds for player:", currentPlayerAddress);
+            
+            // Jeśli to nasza tura - wywołaj dobieranie karty
+            if (currentPlayerAddress === publicKey.toString()) {
+              console.log("Auto-skip our turn");
+              await handleDrawCard();
+            } 
+            // Jeśli to nie nasza tura, ale jesteśmy w pokoju, próbujemy odświeżyć stan gry
+            else if (roomData.players.includes(publicKey.toString())) {
+              console.log("Force refresh due to inactive opponent");
+              await loadRoomAndGameInfo(true);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Error in auto-skip check:", error);
+      }
+    };
+    
+    // Wykonaj pierwsze sprawdzenie po załadowaniu
+    syncAutoSkip();
+    
+    // Sprawdzaj co 5 sekund
+    const interval = setInterval(syncAutoSkip, 5000);
+    
+    return () => clearInterval(interval);
+  }, [gameStatus, roomId, wallet, publicKey, maxTurnTime, loadRoomAndGameInfo]);
   
   // Awaryjne odświeżanie co 10 sekund
   useEffect(() => {
@@ -375,7 +466,7 @@ function GameRoom({ roomId, onBack }) {
     
     // Jeśli to jest tura przeciwnika, aktualizuj timer
     if (state.currentPlayerIndex !== playerIndex && state.turnStartTime) {
-      const remainingTime = calculateRemainingTime(state.turnStartTime);
+      const remainingTime = calculateRemainingTime(state.turnStartTime, maxTurnTime);
       setTurnTimer(remainingTime);
     }
   };
