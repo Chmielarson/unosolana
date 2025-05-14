@@ -1,12 +1,14 @@
 // src/components/RoomsList.js
 import React, { useState, useEffect } from 'react';
 import { getRooms } from '../utils/SolanaTransactions';
+import { listenForRooms } from '../firebase';
 
 function RoomsList({ onJoinRoom }) {
   const [rooms, setRooms] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    // Początkowe pobranie pokojów (jeśli nasłuchiwacz wolno reaguje)
     const fetchRooms = async () => {
       try {
         setIsLoading(true);
@@ -21,10 +23,19 @@ function RoomsList({ onJoinRoom }) {
 
     fetchRooms();
     
-    // Odświeżanie co 5 sekund
-    const interval = setInterval(fetchRooms, 5000);
+    // Zamiast interwału, używamy nasłuchiwaczy Firebase
+    const unsubscribe = listenForRooms((roomsData) => {
+      console.log("Rooms updated in real-time:", roomsData);
+      setRooms(roomsData);
+      setIsLoading(false);
+    });
     
-    return () => clearInterval(interval);
+    // Sprzątanie - anulowanie nasłuchiwania przy odmontowaniu komponentu
+    return () => {
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
   }, []);
 
   const handleRefresh = async () => {

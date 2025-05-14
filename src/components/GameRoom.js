@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { joinRoom, getRoomInfo, getGameState, playCard, drawCard, claimPrize } from '../utils/SolanaTransactions';
+import { listenForRoom, listenForGameState } from '../firebase';
 
 function GameRoom({ roomId, onBack }) {
   const wallet = useWallet();
@@ -88,39 +89,243 @@ function GameRoom({ roomId, onBack }) {
     }
   }, [roomId, publicKey, wallet, isLoading, isRefreshing, onBack]);
 
-  // Dodaj odświeżanie co 1.5 sekundy
+  // Użyj nasłuchiwaczy do reaktywnego odświeżania zamiast interwałów czasowych
   useEffect(() => {
     if (!roomId || !publicKey) return;
 
-    // Początkowe załadowanie
+    console.log("Setting up initial room data and listeners");
+    
+    // Oznacz, że ładowanie się rozpoczęło
     setIsLoading(true);
-    loadRoomAndGameInfo();
-
-    // Periodyczne odświeżanie
-    const interval = setInterval(() => {
-      loadRoomAndGameInfo();
-    }, 1500); // Szybsze odświeżanie dla lepszej responsywności
-
-    return () => clearInterval(interval);
-  }, [roomId, publicKey, loadRoomAndGameInfo]);
+    
+    // Jednorazowe załadowanie danych pokoju
+    let initialDataLoaded = false;
+    const loadInitialData = async () => {
+      if (initialDataLoaded) return;
+      
+      try {
+        console.log("Loading initial room info");
+        const info = await getRoomInfo(roomId);
+        console.log("Initial room info loaded");
+        setRoomInfo(info);
+        
+        const playerAddr = publicKey.toString();
+        const playerIdx = info.players.indexOf(playerAddr);
+        setPlayerIndex(playerIdx);
+        
+        if (playerIdx !== -1) {
+          // Już jesteśmy w pokoju
+          if (info.gameStarted) {
+            setGameStatus('playing');
+            try {
+              const state = await getGameState(roomId, wallet);
+              updateGameState(state);
+            } catch (error) {
+              console.error('Error loading initial game state:', error);
+            }
+          } else {
+            setGameStatus('waiting');
+          }
+        } else if (info.currentPlayers < info.maxPlayers && !info.gameStarted) {
+          setGameStatus('joining');
+        } else {
+          alert('Nie można dołączyć do tego pokoju');
+          onBack();
+        }
+        
+        if (info.winner) {
+          setWinner(info.winner);
+          setGameStatus('ended');
+        }
+        
+        initialDataLoaded = true;
+      } catch (error) {
+        console.error('Error loading initial room data:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    
+    // Załaduj dane początkowe
+    loadInitialData();
+    
+    // Zmienne do przechowywania funkcji anulujących nasłuchiwanie
+    let unsubscribeRoom = null;
+    let unsubscribeGameState = null;
+    
+    // Ustaw nasłuchiwacze tylko po załadowaniu początkowych danych
+    const setupListeners = () => {
+      // Zatrzymaj istniejące nasłuchiwacze, jeśli istnieją
+      if (unsubscribeRoom) unsubscribeRoom();
+      if (unsubscribeGameState) unsubscribeGameState();
+      
+      // Nasłuchiwacz danych pokoju - z zabezpieczeniem przed rekurencyjnymi aktualizacjami
+      let lastRoomUpdate = Date.now();
+      unsubscribeRoom = listenForRoom(roomId, (roomData) => {
+        // Ograniczenie częstotliwości aktualizacji
+        const now = Date.now();
+        if (now - lastRoomUpdate < 500) return;
+        lastRoomUpdate = now;
+        
+        setRoomInfo(prev => {
+          // Sprawdź, czy dane faktycznie się zmieniły
+          if (JSON.stringify(prev) === JSON.stringify(roomData)) {
+            return prev; // Brak zmian, nie aktualizuj stanu
+          }
+          
+          // Poniższe aktualizacje wykonujemy w osobnych setTimeout, 
+          // aby uniknąć zbyt wielu aktualizacji stanu w jednym cyklu
+          setTimeout(() => {
+            // Aktualizacja statusu gry na podstawie danych pokoju
+            if (roomData.gameStarted) {
+              setGameStatus(prev => prev !== 'playing' ? 'playing' : prev);
+            }
+            
+            if (roomData.winner) {
+              setWinner(roomData.winner);
+              setGameStatus(prev => prev !== 'ended' ? 'ended' : prev);
+            }
+            
+            // Aktualizacja indeksu gracza
+            const playerIdx = roomData.players.indexOf(publicKey.toString());
+            setPlayerIndex(prev => prev !== playerIdx ? playerIdx : prev);
+          }, 0);
+          
+          return roomData;
+        });
+      });
+      
+      // Nasłuchiwacz stanu gry - z zabezpieczeniem przed rekurencyjnymi aktualizacjami
+      let lastGameStateUpdate = Date.now();
+      unsubscribeGameState = listenForGameState(roomId, publicKey.toString(), (gameStateData) => {
+        // Ograniczenie częstotliwości aktualizacji
+        const now = Date.now();
+        if (now - lastGameStateUpdate < 500) return;
+        lastGameStateUpdate = now;
+        
+        // Użyj funkcji callback do setState, aby mieć dostęp do poprzedniego stanu
+        setGameState(prev => {
+          // Sprawdź, czy dane faktycznie się zmieniły
+          if (JSON.stringify(prev) === JSON.stringify(gameStateData)) {
+            return prev; // Brak zmian, nie aktualizuj stanu
+          }
+          
+          // Bezpieczna aktualizacja pozostałych stanów
+          setTimeout(() => updateGameState(gameStateData), 0);
+          return gameStateData;
+        });
+      });
+    };
+    
+    // Poczekaj chwilę przed ustawieniem nasłuchiwaczy, aby początkowe dane miały czas się załadować
+    const listenersTimeout = setTimeout(() => {
+      setupListeners();
+    }, 500);
+    
+    // Funkcja czyszcząca
+    return () => {
+      clearTimeout(listenersTimeout);
+      if (unsubscribeRoom) unsubscribeRoom();
+      if (unsubscribeGameState) unsubscribeGameState();
+    };
+  }, [roomId, publicKey, wallet, onBack]);  // Usuń loadRoomAndGameInfo z zależności, dodaj wallet i onBack
 
   // Aktualizacja stanu gry
   const updateGameState = (state) => {
     if (!state) return;
     
-    setGameState(state);
-    setPlayerHand(state.playerHand || []);
-    setCurrentCard(state.currentCard || null); // Dodaj zabezpieczenie na wypadek, gdyby currentCard było undefined
-    setCurrentPlayerIndex(state.currentPlayerIndex || 0);
-    setOpponentsCards(state.otherPlayersCardCount || {});
-    setDeckSize(state.deckSize || 0);
-    setDirection(state.direction || 1);
-    setLastAction(state.lastAction || null);
-    
-    if (state.winner) {
-      setWinner(state.winner);
-      setGameStatus('ended');
+    // Najpierw sprawdź, czy dane faktycznie się zmieniły
+    if (gameState) {
+      const currentStateJSON = JSON.stringify({
+        hand: playerHand,
+        card: currentCard,
+        playerIndex: currentPlayerIndex,
+        opponents: opponentsCards,
+        deck: deckSize,
+        dir: direction,
+        action: lastAction
+      });
+      
+      const newStateJSON = JSON.stringify({
+        hand: state.playerHand || [],
+        card: state.currentCard || null,
+        playerIndex: state.currentPlayerIndex || 0,
+        opponents: state.otherPlayersCardCount || {},
+        deck: state.deckSize || 0,
+        dir: state.direction || 1,
+        action: state.lastAction || null
+      });
+      
+      // Jeśli stan się nie zmienił, nie aktualizuj niczego
+      if (currentStateJSON === newStateJSON) {
+        return;
+      }
     }
+    
+    // Aktualizuj stany w requestAnimationFrame, aby uniknąć nadmiernych re-renderów
+    requestAnimationFrame(() => {
+      // Aktualizacja wszystkich stanów w jednym cyklu renderu
+      const updates = {};
+      let hasUpdates = false;
+      
+      // Pomocnicza funkcja do sprawdzania, czy wartość się zmieniła
+      const shouldUpdate = (currentVal, newVal) => {
+        // Dla prostych typów
+        if (typeof newVal !== 'object' || newVal === null) {
+          return currentVal !== newVal;
+        }
+        
+        // Dla obiektów i tablic
+        return JSON.stringify(currentVal) !== JSON.stringify(newVal);
+      };
+      
+      // Sprawdź i zaktualizuj ręcznie każdy stan, tylko jeśli się zmienił
+      if (shouldUpdate(playerHand, state.playerHand || [])) {
+        setPlayerHand(state.playerHand || []);
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(currentCard, state.currentCard || null)) {
+        setCurrentCard(state.currentCard || null);
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(currentPlayerIndex, state.currentPlayerIndex || 0)) {
+        setCurrentPlayerIndex(state.currentPlayerIndex || 0);
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(opponentsCards, state.otherPlayersCardCount || {})) {
+        setOpponentsCards(state.otherPlayersCardCount || {});
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(deckSize, state.deckSize || 0)) {
+        setDeckSize(state.deckSize || 0);
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(direction, state.direction || 1)) {
+        setDirection(state.direction || 1);
+        hasUpdates = true;
+      }
+      
+      if (shouldUpdate(lastAction, state.lastAction || null)) {
+        setLastAction(state.lastAction || null);
+        hasUpdates = true;
+      }
+      
+      // Aktualizuj winner i gameStatus tylko jeśli są zmiany
+      if (state.winner && winner !== state.winner) {
+        setWinner(state.winner);
+        setGameStatus('ended');
+        hasUpdates = true;
+      }
+      
+      if (hasUpdates) {
+        console.log('Game state updated with changes');
+      }
+    });
   };
 
   // Dołączenie do pokoju
@@ -132,26 +337,67 @@ function GameRoom({ roomId, onBack }) {
     
     try {
       setIsLoading(true);
-      console.log("Joining room:", roomId, "with entry fee:", roomInfo?.entryFee);
-      
+      console.log("Joining room:", roomId);
+
       if (!roomInfo) {
         console.log("No room info available, reloading");
-        await loadRoomAndGameInfo();
-        if (!roomInfo) {
+        try {
+          const info = await getRoomInfo(roomId);
+          setRoomInfo(info);
+        } catch (error) {
+          console.error("Error loading room info:", error);
           throw new Error('Nie można załadować informacji o pokoju');
         }
       }
       
-      console.log("Starting join room process with wallet:", wallet);
-      await joinRoom(roomId, roomInfo.entryFee, wallet);
-      console.log("Join room successful");
+      if (!roomInfo?.entryFee) {
+        throw new Error('Brak informacji o wpisowym');
+      }
       
-      // Reload room info after joining
-      console.log("Reloading room info after joining");
-      await loadRoomAndGameInfo();
+      // Najpierw zabezpieczmy się przed równoległymi żądaniami
+      const entryFeeValue = parseFloat(roomInfo.entryFee);
+      if (isNaN(entryFeeValue)) {
+        throw new Error('Nieprawidłowa kwota wpisowego');
+      }
+      
+      console.log("Entry fee confirmed:", entryFeeValue);
+      
+      // WAŻNE: Sprawdź, czy już jesteś w pokoju
+      const playerAddr = publicKey.toString();
+      if (roomInfo.players && roomInfo.players.includes(playerAddr)) {
+        console.log("Player already in room, updating status");
+        setGameStatus('waiting');
+        return;
+      }
+      
+      console.log("Starting join room process with fee:", entryFeeValue);
+      
+      // Uproszczony proces dołączania - jednokrotne wywołanie zamiast kilku wywołań zwrotnych 
+      try {
+        const result = await joinRoom(roomId, entryFeeValue, wallet);
+        console.log("Join room successful:", result);
+        
+        // Zamiast automatycznego odświeżania tutaj, ręcznie ustawmy stan
+        setGameStatus('waiting');
+        
+        // Ręczne odświeżenie po 1 sekundzie
+        setTimeout(async () => {
+          try {
+            const updatedInfo = await getRoomInfo(roomId);
+            setRoomInfo(updatedInfo);
+            const playerIdx = updatedInfo.players.indexOf(playerAddr);
+            setPlayerIndex(playerIdx);
+          } catch (refreshError) {
+            console.error("Error refreshing room info:", refreshError);
+          }
+        }, 1000);
+      } catch (joinError) {
+        console.error("Error in joinRoom:", joinError);
+        throw joinError;
+      }
     } catch (error) {
       console.error('Error joining room:', error);
-      alert('Błąd podczas dołączania do pokoju: ' + error.message);
+      alert(`Błąd podczas dołączania do pokoju: ${error.message}`);
     } finally {
       setIsLoading(false);
     }

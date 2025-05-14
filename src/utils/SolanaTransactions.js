@@ -1,4 +1,4 @@
-// src/utils/SolanaTransactions.js
+// src/utils/SolanaTransactions.js (część 1)
 import { 
   Connection, 
   SystemProgram, 
@@ -20,49 +20,70 @@ const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 // W rzeczywistej implementacji, zastąp ten adres rzeczywistym adresem programu
 const PROGRAM_ID = new PublicKey('3PtVXcKqQTQpUyCn5RCsrKL9nnHsAD6Kinf81LeBr1Vs');
 
-// Funkcja pomocnicza do symulacji transakcji Solany
+// Zamień TYLKO funkcję simulateTransaction w pliku src/utils/SolanaTransactions.js:
+
 async function simulateTransaction(amount, wallet) {
   console.log("Simulating transaction for amount:", amount, "SOL");
-  console.log("Wallet object:", wallet);
-  console.log("Public key:", wallet.publicKey?.toString());
-  console.log("Sign transaction function available:", !!wallet.signTransaction);
+  
+  if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) {
+    throw new Error(`Nieprawidłowa kwota: ${amount} SOL`);
+  }
+  
+  if (!wallet || !wallet.publicKey || !wallet.signTransaction) {
+    throw new Error('Nieprawidłowy portfel');
+  }
   
   const { publicKey, signTransaction } = wallet;
   
-  if (!publicKey || !signTransaction) {
-    throw new Error('Portfel nie jest połączony');
-  }
+  // Konwersja SOL na lamports (1 SOL = 1,000,000,000 lamports)
+  const lamports = Math.round(amount * LAMPORTS_PER_SOL);
 
   try {
-    console.log("Creating transaction...");
     // Tworzenie transakcji
     const transaction = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: publicKey,
-        toPubkey: PROGRAM_ID, // W rzeczywistości byłby to adres programu lub PDA
-        lamports: amount * LAMPORTS_PER_SOL
+        toPubkey: PROGRAM_ID,
+        lamports: lamports
       })
     );
 
-    // Pobierz ostatni blok aby ustawić parametry transakcji
-    console.log("Getting latest blockhash...");
-    const { blockhash } = await connection.getLatestBlockhash();
+    // Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = publicKey;
 
     // Podpisz transakcję
-    console.log("Signing transaction...");
-    const signedTransaction = await signTransaction(transaction);
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
 
     // Wyślij transakcję
-    console.log("Sending transaction...");
     const signature = await connection.sendRawTransaction(
       signedTransaction.serialize()
     );
 
-    // Poczekaj na potwierdzenie
-    console.log("Waiting for confirmation...");
-    await connection.confirmTransaction(signature, 'confirmed');
+    // Poczekaj na potwierdzenie z timeoutem
+    const confirmationPromise = connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    // Dodaj timeout 15 sekund
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Timeout potwierdzenia transakcji')), 15000)
+    );
+    
+    // Wyścig między potwierdzeniem a timeoutem
+    const confirmation = await Promise.race([confirmationPromise, timeoutPromise]);
+    
+    if (confirmation.value && confirmation.value.err) {
+      throw new Error(`Transakcja odrzucona: ${JSON.stringify(confirmation.value.err)}`);
+    }
 
     console.log("Transaction confirmed:", signature);
     return signature;
@@ -152,37 +173,48 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
   }
 }
 
-// Funkcja do dołączenia do pokoju
+// Zamień TYLKO funkcję joinRoom w pliku src/utils/SolanaTransactions.js:
+
 export async function joinRoom(roomId, entryFee, wallet) {
-  console.log("Join room function called with:", { roomId, entryFee });
-  console.log("Wallet:", wallet);
+  console.log("Join room function called:", { roomId, entryFee });
   
-  const { publicKey } = wallet;
+  // Zabezpieczenie przed nieprawidłowymi danymi wejściowymi
+  if (!roomId) {
+    throw new Error('Brak identyfikatora pokoju');
+  }
   
-  if (!publicKey) {
-    console.error("No public key in wallet");
+  if (typeof entryFee !== 'number' || isNaN(entryFee) || entryFee <= 0) {
+    throw new Error('Nieprawidłowa kwota wpisowego');
+  }
+  
+  if (!wallet || !wallet.publicKey) {
     throw new Error('Portfel nie jest połączony');
+  }
+  
+  const { publicKey, signTransaction } = wallet;
+  
+  if (!signTransaction) {
+    throw new Error('Portfel nie ma funkcji podpisywania transakcji');
   }
 
   try {
+    // 1. Pobierz dane pokoju
     const roomRef = doc(db, 'rooms', roomId);
-    console.log("Room reference:", roomRef);
-    
     const roomSnap = await getDoc(roomRef);
-    console.log("Room snapshot exists:", roomSnap.exists());
     
     if (!roomSnap.exists()) {
       throw new Error('Pokój nie istnieje');
     }
     
     const roomData = roomSnap.data();
-    console.log("Room data before joining:", roomData);
     
+    // 2. Sprawdź, czy gracz już jest w pokoju
     if (roomData.players.includes(publicKey.toString())) {
-      console.log("Player already in room, returning early");
-      return; // Już jesteś w tym pokoju
+      console.log("Player already in room");
+      return true; // Już jesteś w tym pokoju
     }
     
+    // 3. Walidacja
     if (roomData.players.length >= roomData.maxPlayers) {
       throw new Error('Pokój jest pełny');
     }
@@ -191,47 +223,71 @@ export async function joinRoom(roomId, entryFee, wallet) {
       throw new Error('Gra już się rozpoczęła');
     }
 
-    // Przywrócenie rzeczywistej transakcji wpisowego
-    await simulateTransaction(entryFee, wallet);
-    
-    // Dodaj gracza do pokoju
+    // 4. Najpierw zapisz gracza do pokoju (ważne, żeby zrobić to przed transakcją)
+    console.log("Adding player to room:", publicKey.toString());
     await updateDoc(roomRef, {
       players: arrayUnion(publicKey.toString())
     });
     
-    // Dodaj gracza do stanu gry
-    const gameStateRef = doc(db, 'gameStates', roomId);
-    const gameStateSnap = await getDoc(gameStateRef);
-    
-    if (gameStateSnap.exists()) {
-      const gameState = gameStateSnap.data();
-      const updatedPlayerHands = { ...gameState.playerHands };
-      updatedPlayerHands[publicKey.toString()] = [];
-      
-      await updateDoc(gameStateRef, {
-        playerHands: updatedPlayerHands
-      });
+    // 5. Transakcja wpisowego
+    console.log("Simulating transaction for entry fee:", entryFee);
+    try {
+      await simulateTransaction(entryFee, wallet);
+    } catch (txError) {
+      // W przypadku błędu transakcji, usuń gracza z pokoju
+      try {
+        const updatedRoomData = { 
+          players: roomData.players.filter(p => p !== publicKey.toString()) 
+        };
+        await updateDoc(roomRef, updatedRoomData);
+      } catch (cleanupError) {
+        console.error("Error cleaning up after failed transaction:", cleanupError);
+      }
+      throw txError;
     }
     
-    // Jeśli pokój jest pełny, rozpocznij grę
-    const updatedRoomSnap = await getDoc(roomRef);
-    const updatedRoomData = updatedRoomSnap.data();
-    
-    if (updatedRoomData.players.length >= updatedRoomData.maxPlayers) {
-      await updateDoc(roomRef, {
-        gameStarted: true
-      });
+    // 6. Dodaj gracza do stanu gry
+    console.log("Adding player to game state");
+    try {
+      const gameStateRef = doc(db, 'gameStates', roomId);
+      const gameStateSnap = await getDoc(gameStateRef);
       
-      // Inicjalizacja gry
-      await initializeGameState(roomId);
+      if (gameStateSnap.exists()) {
+        const gameState = gameStateSnap.data();
+        
+        // Przygotuj aktualizację ręki gracza
+        const updatedPlayerHands = { ...gameState.playerHands };
+        updatedPlayerHands[publicKey.toString()] = [];
+        
+        await updateDoc(gameStateRef, {
+          playerHands: updatedPlayerHands
+        });
+      }
+    } catch (gameStateError) {
+      console.error("Error updating game state:", gameStateError);
+      // Kontynuujemy mimo błędu, bo gracz i tak jest już w pokoju
     }
     
-    // Sprawdź po dodaniu gracza
-    const finalRoomSnap = await getDoc(roomRef);
-    const finalRoomData = finalRoomSnap.data();
-    console.log("Room data after joining:", finalRoomData);
-    console.log("Player now in room:", finalRoomData.players.includes(publicKey.toString()));
+    // 7. Sprawdź, czy pokój jest pełny - rozpocznij grę, jeśli tak
+    try {
+      const updatedRoomSnap = await getDoc(roomRef);
+      const updatedRoomData = updatedRoomSnap.data();
+      
+      if (updatedRoomData.players.length >= updatedRoomData.maxPlayers) {
+        console.log("Room is full, starting game");
+        await updateDoc(roomRef, {
+          gameStarted: true
+        });
+        
+        // Inicjalizacja gry
+        await initializeGameState(roomId);
+      }
+    } catch (startGameError) {
+      console.error("Error starting game:", startGameError);
+      // Nie przerywa, dołączanie i tak już zakończone
+    }
     
+    console.log("Join room completed successfully");
     return true;
   } catch (error) {
     console.error('Error joining room:', error);
