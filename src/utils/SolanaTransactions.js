@@ -295,7 +295,8 @@ export async function joinRoom(roomId, entryFee, wallet) {
   }
 }
 
-// Inicjalizacja stanu gry po rozpoczęciu
+// Funkcja initializeGameState w SolanaTransactions.js
+
 async function initializeGameState(roomId) {
   console.log("Initializing game state for room:", roomId);
   try {
@@ -316,13 +317,11 @@ async function initializeGameState(roomId) {
       return;
     }
     
-    const gameState = gameStateSnap.data();
-    
-    // Utworzenie talii kart
+    // Utwórz nową talię kart
     const deck = createAndShuffleDeck();
     console.log("Deck created with", deck.length, "cards");
     
-    // Rozdaj karty graczom
+    // Rozdaj karty graczom - WAŻNE: upewnij się, że każdy gracz otrzymuje karty
     const playerHands = {};
     
     for (const playerAddress of roomData.players) {
@@ -335,15 +334,17 @@ async function initializeGameState(roomId) {
       console.log("Dealt", playerHands[playerAddress].length, "cards to player", playerAddress);
     }
     
-    // Pierwsza karta na stole
+    // Wyłóż pierwszą kartę na stół
     let currentCard = null;
     if (deck.length > 0) {
       currentCard = deck.pop();
       
-      // Jeśli pierwsza karta to Wild lub Wild4, losuj ponownie
-      while (currentCard.color === 'black') {
-        deck.push(currentCard);
-        currentCard = deck.pop();
+      // Jeśli pierwsza karta to Wild lub Wild4, wybierz losowo kolor
+      if (currentCard.color === 'black') {
+        const colors = ['red', 'blue', 'green', 'yellow'];
+        const randomColor = colors[Math.floor(Math.random() * colors.length)];
+        currentCard = { ...currentCard, color: randomColor };
+        console.log("First card was Wild, changed color to:", randomColor);
       }
     }
     
@@ -359,6 +360,7 @@ async function initializeGameState(roomId) {
       gameStarted: true,
       lastAction: {
         action: 'start',
+        player: roomData.players[0],
         timestamp: new Date().toISOString()
       }
     });
@@ -368,7 +370,6 @@ async function initializeGameState(roomId) {
     console.error("Error initializing game state:", error);
   }
 }
-
 // Funkcja do utworzenia i potasowania talii kart UNO
 function createAndShuffleDeck() {
   const colors = ['red', 'blue', 'green', 'yellow'];

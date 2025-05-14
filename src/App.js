@@ -17,14 +17,59 @@ window.addEventListener('unhandledrejection', (event) => {
   console.error('Unhandled Promise Rejection:', event.reason);
 });
 
+// Funkcje pomocnicze do zarządzania stanem pokoju w localStorage
+const saveRoomToLocalStorage = (roomId) => {
+  if (roomId) {
+    localStorage.setItem('uno_current_room', roomId);
+    localStorage.setItem('uno_room_timestamp', Date.now().toString());
+  }
+};
+
+const getRoomFromLocalStorage = () => {
+  const roomId = localStorage.getItem('uno_current_room');
+  const timestamp = localStorage.getItem('uno_room_timestamp');
+  
+  // Sprawdź, czy pokój nie jest zbyt stary (30 minut)
+  if (roomId && timestamp) {
+    const now = Date.now();
+    const roomTime = parseInt(timestamp, 10);
+    
+    // Jeśli pokój jest starszy niż 30 minut, usuń go
+    if (now - roomTime > 30 * 60 * 1000) {
+      localStorage.removeItem('uno_current_room');
+      localStorage.removeItem('uno_room_timestamp');
+      return null;
+    }
+    
+    return roomId;
+  }
+  
+  return null;
+};
+
+const clearRoomFromLocalStorage = () => {
+  localStorage.removeItem('uno_current_room');
+  localStorage.removeItem('uno_room_timestamp');
+};
+
 // Domyślnie używamy sieci devnet
 const network = WalletAdapterNetwork.Devnet;
 const endpoint = clusterApiUrl(network);
 const wallets = [new PhantomWalletAdapter()];
 
 function App() {
-  const [currentView, setCurrentView] = useState('roomsList'); // roomsList, createRoom, gameRoom
-  const [currentRoomId, setCurrentRoomId] = useState(null);
+  // Zmiana inicjalizacji stanu, aby sprawdzić localStorage
+  const [currentView, setCurrentView] = useState(() => {
+    // Sprawdź, czy mamy zapisany pokój
+    const savedRoom = getRoomFromLocalStorage();
+    return savedRoom ? 'gameRoom' : 'roomsList';
+  });
+  
+  const [currentRoomId, setCurrentRoomId] = useState(() => {
+    // Pobierz zapisany pokój z localStorage
+    return getRoomFromLocalStorage();
+  });
+  
   const [isWalletConnected, setIsWalletConnected] = useState(false);
 
   const handleWalletConnection = (connected) => {
@@ -40,6 +85,8 @@ function App() {
   };
 
   const navigateToRoomsList = () => {
+    // Wyczyść informacje o zapisanym pokoju
+    clearRoomFromLocalStorage();
     setCurrentView('roomsList');
     setCurrentRoomId(null); // Upewnij się, że resetujesz ID pokoju
   };
@@ -49,6 +96,8 @@ function App() {
       alert('Połącz portfel, aby dołączyć do pokoju');
       return;
     }
+    // Zapisz pokój do localStorage podczas dołączania
+    saveRoomToLocalStorage(roomId);
     setCurrentRoomId(roomId);
     setCurrentView('gameRoom');
   };
@@ -75,6 +124,8 @@ function App() {
 
               {currentView === 'createRoom' && (
                 <CreateRoom onBack={navigateToRoomsList} onRoomCreated={(roomId) => {
+                  // Zapisz pokój do localStorage podczas tworzenia
+                  saveRoomToLocalStorage(roomId);
                   setCurrentRoomId(roomId);
                   setCurrentView('gameRoom');
                 }} />
