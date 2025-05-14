@@ -1,7 +1,7 @@
 // src/components/GameRoom.js
 import React, { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { joinRoom, getRoomInfo, getGameState, playCard, drawCard, claimPrize } from '../utils/SolanaTransactions';
+import { joinRoom, getRoomInfo, getGameState, playCard, drawCard, claimPrize, leaveGame, autoSkipTurn } from '../utils/SolanaTransactions';
 import { listenForRoom, listenForGameState } from '../firebase';
 
 function GameRoom({ roomId, onBack }) {
@@ -25,6 +25,8 @@ function GameRoom({ roomId, onBack }) {
   const [direction, setDirection] = useState(1);
   const [lastAction, setLastAction] = useState(null);
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState(0);
+  const [turnTimer, setTurnTimer] = useState(0);
+  const [maxTurnTime] = useState(30); // 30 sekund na ruch
 
   // Funkcja łącząca ładowanie informacji o pokoju i stanie gry z deduplikacją
   const loadRoomAndGameInfo = useCallback(async (force = false) => {
@@ -208,43 +210,112 @@ function GameRoom({ roomId, onBack }) {
     };
   }, [roomId, publicKey, wallet, gameStatus, isLoading]);
   
-  // Dodatkowy efekt do aktywnego sprawdzania, gdy jest nasza kolej
+  // Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
+  const calculateRemainingTime = (turnStartTime) => {
+    if (!turnStartTime) return maxTurnTime;
+    
+    const startTime = new Date(turnStartTime).getTime();
+    const now = Date.now();
+    const elapsedSeconds = Math.floor((now - startTime) / 1000);
+    const remainingTime = Math.max(0, maxTurnTime - elapsedSeconds);
+    
+    return remainingTime;
+  };
+  
+  // Efekt do odliczania czasu dla aktualnego gracza
+  useEffect(() => {
+    // Uruchamiamy timer tylko gdy jest nasza kolej i gra jest w toku
+    if (
+      gameStatus !== 'playing' ||
+      currentPlayerIndex !== playerIndex ||
+      !publicKey
+    ) {
+      setTurnTimer(0);
+      return;
+    }
+    
+    console.log("Starting turn timer");
+    
+    // Ustaw początkowy czas na podstawie turnStartTime jeśli istnieje
+    if (gameState?.turnStartTime) {
+      const remainingTime = calculateRemainingTime(gameState.turnStartTime);
+      setTurnTimer(remainingTime);
+    } else {
+      setTurnTimer(maxTurnTime);
+    }
+    
+    // Rozpocznij odliczanie
+    const interval = setInterval(() => {
+      setTurnTimer(prevTime => {
+        const newTime = prevTime - 1;
+        
+        // Gdy czas się skończy, automatycznie dobierz kartę
+        if (newTime <= 0) {
+          clearInterval(interval);
+          console.log("Time's up! Auto-drawing card");
+          handleDrawCard().catch(error => {
+            console.error("Error auto-drawing card:", error);
+          });
+          return 0;
+        }
+        
+        return newTime;
+      });
+    }, 1000);
+    
+    return () => {
+      clearInterval(interval);
+    };
+  }, [gameStatus, currentPlayerIndex, playerIndex, publicKey, maxTurnTime, gameState?.turnStartTime]);
+  
+  // Efekt do sprawdzania czasu przeciwnika
   useEffect(() => {
     if (
-      gameStatus !== 'playing' || 
-      currentPlayerIndex !== playerIndex || 
-      !roomId || 
-      !wallet || 
+      gameStatus !== 'playing' ||
+      currentPlayerIndex === playerIndex ||
+      !roomId ||
+      !wallet ||
       !publicKey
     ) {
       return;
     }
     
-    console.log("It's our turn, setting up active polling");
+    if (!gameState?.turnStartTime) return;
     
-    // Gdy jest nasza kolej, sprawdzaj stan gry co 3 sekundy
+    console.log("Monitoring opponent's turn time");
+    
+    const remainingTime = calculateRemainingTime(gameState.turnStartTime);
+    if (remainingTime > 0) {
+      setTurnTimer(remainingTime);
+    }
+    
+    // Sprawdzaj co sekundę, czy przeciwnik nie przekroczył czasu
     const interval = setInterval(async () => {
-      try {
-        console.log("Active polling - checking game state");
-        const state = await getGameState(roomId, wallet);
+      const currentRemaining = calculateRemainingTime(gameState.turnStartTime);
+      
+      setTurnTimer(currentRemaining);
+      
+      // Jeśli czas się skończył, ale nadal jest tura przeciwnika
+      if (currentRemaining <= 0) {
+        console.log("Opponent time's up! Fetching game state to check turn");
         
-        // Sprawdź czy wciąż jest nasza kolej
-        if (state.currentPlayerIndex !== playerIndex) {
-          console.log("Turn changed, clearing active polling");
-          clearInterval(interval);
-        } else {
-          updateGameState(state);
+        try {
+          // Sprawdź aktualny stan gry, aby upewnić się, że nadal jest tura przeciwnika
+          const state = await getGameState(roomId, wallet);
+          
+          if (state.currentPlayerIndex !== playerIndex) {
+            // Przeciwnik nie wykonał ruchu w czasie
+            console.log("Opponent didn't make a move in time, refreshing game state");
+            await loadRoomAndGameInfo(true);
+          }
+        } catch (error) {
+          console.error("Error checking opponent time:", error);
         }
-      } catch (error) {
-        console.error("Error in active polling:", error);
       }
-    }, 3000);
+    }, 1000);
     
-    return () => {
-      console.log("Cleaning up active polling");
-      clearInterval(interval);
-    };
-  }, [roomId, wallet, publicKey, gameStatus, currentPlayerIndex, playerIndex]);
+    return () => clearInterval(interval);
+  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo]);
   
   // Awaryjne odświeżanie co 10 sekund
   useEffect(() => {
@@ -280,6 +351,7 @@ function GameRoom({ roomId, onBack }) {
       hasCurrentCard: !!state.currentCard,
       currentPlayer: state.currentPlayerIndex,
       deckSize: state.deckSize,
+      turnStartTime: state.turnStartTime,
       timestamp: new Date().toISOString()
     });
     
@@ -299,6 +371,12 @@ function GameRoom({ roomId, onBack }) {
     if (state.winner && winner !== state.winner) {
       setWinner(state.winner);
       setGameStatus('ended');
+    }
+    
+    // Jeśli to jest tura przeciwnika, aktualizuj timer
+    if (state.currentPlayerIndex !== playerIndex && state.turnStartTime) {
+      const remainingTime = calculateRemainingTime(state.turnStartTime);
+      setTurnTimer(remainingTime);
     }
   };
 
@@ -527,6 +605,34 @@ function GameRoom({ roomId, onBack }) {
     }
   };
 
+  // Obsługa przycisku powrotu
+  const handleBackButton = async () => {
+    // Jeśli gra jest w toku i pokój jest pełny, potwierdzenie
+    if (gameStatus === 'playing' && roomInfo?.currentPlayers > 1) {
+      const confirmLeave = window.confirm("Czy na pewno chcesz opuścić grę? Spowoduje to automatyczną przegraną i przeciwnik zostanie zwycięzcą!");
+      
+      if (confirmLeave) {
+        try {
+          setIsLoading(true);
+          await leaveGame(roomId, wallet);
+          onBack();
+        } catch (error) {
+          console.error("Error leaving game:", error);
+          alert("Wystąpił błąd podczas opuszczania gry: " + error.message);
+        } finally {
+          setIsLoading(false);
+        }
+        return;
+      } else {
+        // Użytkownik anulował opuszczenie
+        return;
+      }
+    }
+    
+    // W innych przypadkach po prostu wróć
+    onBack();
+  };
+
   // Renderowanie karty UNO
   const renderUnoCard = (card, index, isPlayerHand = false) => {
     // Sprawdź, czy karta istnieje
@@ -573,7 +679,16 @@ function GameRoom({ roomId, onBack }) {
       <div className="opponent" key={index}>
         <div className="opponent-name">
           Gracz {index + 1}
-          {isCurrentPlayer && <span className="current-player-indicator">Teraz gra</span>}
+          {isCurrentPlayer && (
+            <>
+              <span className="current-player-indicator">Teraz gra</span>
+              {isCurrentPlayer && currentPlayerIndex !== playerIndex && (
+                <span className="opponent-timer">
+                  {turnTimer > 0 ? `Pozostało: ${turnTimer}s` : 'Czas minął!'}
+                </span>
+              )}
+            </>
+          )}
         </div>
         <div className="opponent-cards">
           {Array.from({ length: Math.min(cardCount, 7) }).map((_, i) => (
@@ -610,6 +725,11 @@ function GameRoom({ roomId, onBack }) {
       actionText = 'dobrał kartę';
     } else if (lastAction.action === 'start') {
       actionText = 'rozpoczął grę';
+    } else if (lastAction.action === 'leave') {
+      actionText = 'opuścił grę';
+      if (lastAction.result === 'opponent_win') {
+        actionText += ' - przeciwnik wygrywa przez walkower';
+      }
     }
     
     return (
@@ -631,9 +751,10 @@ function GameRoom({ roomId, onBack }) {
       playerHandSize: playerHand?.length || 0,
       hasCurrentCard: !!currentCard,
       opponentsCount: Object.keys(opponentsCards).length,
+      turnTimer,
       timestamp: new Date().toISOString()
     });
-  }, [roomId, gameStatus, playerIndex, currentPlayerIndex, isLoading, roomInfo, playerHand, currentCard, opponentsCards]);
+  }, [roomId, gameStatus, playerIndex, currentPlayerIndex, isLoading, roomInfo, playerHand, currentCard, opponentsCards, turnTimer]);
 
   if (isLoading && !roomInfo) {
     return <div className="loading">Ładowanie pokoju...</div>;
@@ -668,7 +789,7 @@ function GameRoom({ roomId, onBack }) {
           <p>Twój indeks: {playerIndex !== -1 ? playerIndex + 1 : 'Nie jesteś w tym pokoju'}</p>
           <p>ID pokoju: {roomId}</p>
           <button onClick={() => loadRoomAndGameInfo(true)}>Odśwież</button>
-          <button onClick={onBack}>Wróć</button>
+          <button onClick={handleBackButton}>Wróć</button>
         </div>
       )}
       
@@ -775,7 +896,14 @@ function GameRoom({ roomId, onBack }) {
           <div className="player-info">
             <p>Twoje karty ({playerHand?.length || 0})</p>
             {currentPlayerIndex === playerIndex && gameStatus === 'playing' && (
-              <p className="your-turn">Twoja kolej!</p>
+              <>
+                <p className="your-turn">Twoja kolej! <span className="timer">{turnTimer}s</span></p>
+                {turnTimer <= 10 && (
+                  <p className="timer-warning">
+                    Pospiesz się! Zostało mało czasu.
+                  </p>
+                )}
+              </>
             )}
           </div>
           
@@ -809,7 +937,7 @@ function GameRoom({ roomId, onBack }) {
               )}
           </div>
           
-          <button className="back-btn" onClick={onBack}>
+          <button className="back-btn" onClick={handleBackButton}>
             {gameStatus === 'ended' ? 'Wróć do listy pokojów' : 'Opuść grę'}
           </button>
         </div>

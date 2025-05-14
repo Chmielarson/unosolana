@@ -1,4 +1,4 @@
-// src/utils/SolanaTransactions.js (część 1)
+// src/utils/SolanaTransactions.js
 import { 
   Connection, 
   SystemProgram, 
@@ -19,8 +19,6 @@ const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 // Utworzenie Public Key dla programu (smart contract)
 // W rzeczywistej implementacji, zastąp ten adres rzeczywistym adresem programu
 const PROGRAM_ID = new PublicKey('3PtVXcKqQTQpUyCn5RCsrKL9nnHsAD6Kinf81LeBr1Vs');
-
-// Zamień TYLKO funkcję simulateTransaction w pliku src/utils/SolanaTransactions.js:
 
 async function simulateTransaction(amount, wallet) {
   console.log("Simulating transaction for amount:", amount, "SOL");
@@ -98,7 +96,8 @@ export async function getRooms() {
   console.log("Getting rooms list");
   try {
     const roomsCollection = collection(db, 'rooms');
-    const roomsSnapshot = await getDocs(roomsCollection);
+    const roomsQuery = query(roomsCollection, where("isActive", "!=", false)); // Pokaż tylko aktywne pokoje
+    const roomsSnapshot = await getDocs(roomsQuery);
     
     console.log("Rooms found:", roomsSnapshot.docs.length);
     
@@ -138,7 +137,8 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
     players: [publicKey.toString()],
     gameStarted: false,
     winner: null,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    isActive: true // Dodane pole isActive
   };
 
   try {
@@ -162,6 +162,7 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
       currentPlayerIndex: 0,
       direction: 1,
       lastAction: null,
+      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
       gameStarted: false
     });
     
@@ -172,8 +173,6 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
     throw error;
   }
 }
-
-// Zamień TYLKO funkcję joinRoom w pliku src/utils/SolanaTransactions.js:
 
 export async function joinRoom(roomId, entryFee, wallet) {
   console.log("Join room function called:", { roomId, entryFee });
@@ -295,7 +294,88 @@ export async function joinRoom(roomId, entryFee, wallet) {
   }
 }
 
-// Funkcja initializeGameState w SolanaTransactions.js
+// Funkcja do opuszczenia gry (nowa)
+export async function leaveGame(roomId, wallet) {
+  console.log("Player is leaving game:", roomId);
+  try {
+    const { publicKey } = wallet;
+    
+    if (!publicKey) {
+      throw new Error('Portfel nie jest połączony');
+    }
+    
+    const playerAddress = publicKey.toString();
+    
+    // Pobierz dane pokoju
+    const roomRef = doc(db, 'rooms', roomId);
+    const roomSnap = await getDoc(roomRef);
+    
+    if (!roomSnap.exists()) {
+      throw new Error('Pokój nie istnieje');
+    }
+    
+    const roomData = roomSnap.data();
+    
+    // Sprawdź, czy gracz jest w pokoju
+    if (!roomData.players.includes(playerAddress)) {
+      throw new Error('Nie jesteś uczestnikiem tej gry');
+    }
+    
+    // Sprawdź, czy gra jest w toku
+    if (!roomData.gameStarted || roomData.winner) {
+      // Jeśli gra się nie rozpoczęła lub już się zakończyła, po prostu usuń gracza
+      const updatedPlayers = roomData.players.filter(p => p !== playerAddress);
+      
+      if (updatedPlayers.length === 0) {
+        // Jeśli to był ostatni gracz, oznacz pokój jako nieaktywny
+        await updateDoc(roomRef, {
+          players: updatedPlayers,
+          isActive: false,
+          endedAt: new Date().toISOString()
+        });
+      } else {
+        await updateDoc(roomRef, {
+          players: updatedPlayers
+        });
+      }
+      
+      return { success: true, message: 'Opuszczono pokój' };
+    }
+    
+    // Jeśli gra jest w toku, przeciwnik wygrywa
+    const opponentAddress = roomData.players.find(p => p !== playerAddress);
+    
+    if (opponentAddress) {
+      // Ustaw przeciwnika jako zwycięzcę
+      await updateDoc(roomRef, {
+        winner: opponentAddress,
+        endReason: 'player_left'
+      });
+      
+      // Zaktualizuj stan gry
+      const gameStateRef = doc(db, 'gameStates', roomId);
+      await updateDoc(gameStateRef, {
+        lastAction: {
+          player: playerAddress,
+          action: 'leave',
+          timestamp: new Date().toISOString(),
+          result: 'opponent_win'
+        }
+      });
+      
+      return { 
+        success: true, 
+        message: 'Przeciwnik wygrywa przez walkower', 
+        opponentWins: true 
+      };
+    }
+    
+    return { success: true, message: 'Opuszczono pokój' };
+  } catch (error) {
+    console.error('Error leaving game:', error);
+    throw error;
+  }
+}
 
 async function initializeGameState(roomId) {
   console.log("Initializing game state for room:", roomId);
@@ -358,6 +438,7 @@ async function initializeGameState(roomId) {
       currentPlayerIndex: 0,
       direction: 1,
       gameStarted: true,
+      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
       lastAction: {
         action: 'start',
         player: roomData.players[0],
@@ -370,6 +451,7 @@ async function initializeGameState(roomId) {
     console.error("Error initializing game state:", error);
   }
 }
+
 // Funkcja do utworzenia i potasowania talii kart UNO
 function createAndShuffleDeck() {
   const colors = ['red', 'blue', 'green', 'yellow'];
@@ -432,7 +514,8 @@ export async function getRoomInfo(roomId) {
       pool: roomData.entryFee * roomData.players.length,
       gameStarted: roomData.gameStarted,
       winner: roomData.winner,
-      createdAt: roomData.createdAt
+      createdAt: roomData.createdAt,
+      isActive: roomData.isActive !== false
     };
   } catch (error) {
     console.error('Error getting room info:', error);
@@ -482,6 +565,7 @@ export async function getGameState(roomId, wallet) {
       playersCount: roomData.players.length,
       direction: gameState.direction,
       deckSize: gameState.deck.length,
+      turnStartTime: gameState.turnStartTime, // Dodane pole turnStartTime
       otherPlayersCardCount: roomData.players.reduce((acc, addr) => {
         if (addr !== playerAddress) {
           acc[addr] = (gameState.playerHands[addr] || []).length;
@@ -593,6 +677,9 @@ export async function playCard(roomId, cardIndex, chosenColor = null, wallet) {
     // Połącz aktualizacje
     Object.assign(gameStateUpdate, specialCardEffects);
     
+    // Dodaj czas rozpoczęcia tury następnego gracza
+    gameStateUpdate.turnStartTime = new Date().toISOString();
+    
     // Sprawdź, czy gracz wygrał
     if (playerHand.length === 0) {
       // Aktualizuj pokój - ustaw zwycięzcę
@@ -687,6 +774,7 @@ export async function drawCard(roomId, wallet) {
       deck: gameState.deck,
       playerHands: updatedPlayerHands,
       currentPlayerIndex: nextPlayerIndex,
+      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
       lastAction: {
         player: playerAddress,
         action: 'draw',
@@ -820,6 +908,18 @@ function getNextPlayerIndex(playersCount, currentIndex, direction) {
   return (currentIndex + direction + playersCount) % playersCount;
 }
 
+// Funkcja do automatycznego przejścia do następnego gracza po upływie czasu
+export async function autoSkipTurn(roomId, wallet) {
+  console.log("Auto skipping turn due to inactivity");
+  try {
+    // Zasadniczo wywołujemy funkcję drawCard, która przesuwa turę
+    return await drawCard(roomId, wallet);
+  } catch (error) {
+    console.error('Error auto skipping turn:', error);
+    throw error;
+  }
+}
+
 // Funkcja do odebrania nagrody przez zwycięzcę
 export async function claimPrize(roomId, wallet) {
   console.log("Claiming prize for room:", roomId);
@@ -856,10 +956,12 @@ export async function claimPrize(roomId, wallet) {
     // W rzeczywistej implementacji, przesłalibyśmy SOL do zwycięzcy
     // Symulujemy to tylko
     
-    // Oznacz nagrodę jako odebraną
+    // Oznacz nagrodę jako odebraną i pokój jako zakończony
     await updateDoc(roomRef, {
       prizeClaimedBy: playerAddress,
-      prizeClaimedAt: new Date().toISOString()
+      prizeClaimedAt: new Date().toISOString(),
+      isActive: false, // Oznacz pokój jako nieaktywny
+      endedAt: new Date().toISOString()
     });
     
     console.log("Prize claimed successfully:", prize, "SOL");

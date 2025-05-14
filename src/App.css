@@ -758,3 +758,87 @@
   50% { transform: scale(1.05); }
   100% { transform: scale(1); }
 }
+
+/* Timery dla graczy */
+.timer {
+  font-weight: bold;
+  color: #e74c3c;
+  margin-left: 5px;
+}
+
+.timer-warning {
+  color: #e74c3c;
+  font-weight: bold;
+  animation: pulse 1s infinite;
+  font-size: 14px;
+  margin-top: 5px;
+}
+
+.opponent-timer {
+  display: inline-block;
+  background-color: rgba(231, 76, 60, 0.2);
+  color: #e74c3c;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  margin-left: 5px;
+}
+
+/* Responsywność dla mniejszych ekranów */
+@media (max-width: 768px) {
+  .app {
+    padding: 10px;
+  }
+  
+  .app-header {
+    flex-direction: column;
+    padding: 15px;
+  }
+  
+  .app-header h1 {
+    margin-bottom: 15px;
+  }
+  
+  .wallet-info {
+    text-align: center;
+  }
+  
+  .game-info {
+    flex-direction: column;
+    gap: 10px;
+  }
+  
+  .opponents {
+    flex-direction: column;
+    align-items: center;
+  }
+  
+  .opponent {
+    margin-bottom: 15px;
+  }
+  
+  .game-area {
+    flex-direction: column;
+    gap: 20px;
+  }
+  
+  .deck {
+    margin-right: 0;
+    margin-bottom: 20px;
+  }
+  
+  .uno-card {
+    width: 60px;
+    height: 90px;
+    font-size: 14px;
+  }
+  
+  .color-choices {
+    gap: 10px;
+  }
+  
+  .color-choice {
+    width: 40px;
+    height: 40px;
+  }
+}
