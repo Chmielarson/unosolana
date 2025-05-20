@@ -5,119 +5,119 @@ import {
   Transaction, 
   PublicKey, 
   LAMPORTS_PER_SOL,
-  clusterApiUrl
+  clusterApiUrl,
+  TransactionInstruction
 } from '@solana/web3.js';
-import { db } from '../firebase';
-import { 
-  collection, addDoc, getDocs, getDoc, doc, 
-  updateDoc, setDoc, query, where, arrayUnion 
-} from 'firebase/firestore';
+import io from 'socket.io-client';
+import { Buffer } from 'buffer';
 
 // Połączenie z siecią Solana
 const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 
-// Utworzenie Public Key dla programu (smart contract)
-// W rzeczywistej implementacji, zastąp ten adres rzeczywistym adresem programu
-const PROGRAM_ID = new PublicKey('3PtVXcKqQTQpUyCn5RCsrKL9nnHsAD6Kinf81LeBr1Vs');
+// Adres serwera gry
+const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://localhost:3001';
 
-async function simulateTransaction(amount, wallet) {
-  console.log("Simulating transaction for amount:", amount, "SOL");
+// Adres programu Solana (smart contract)
+const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || '3PtVXcKqQTQpUyCn5RCsrKL9nnHsAD6Kinf81LeBr1Vs');
+
+// Instancja Socket.IO
+let socket = null;
+
+// Serializacja danych Borsh dla instrukcji programu Solana
+function serializeCreateRoomData(maxPlayers, entryFee) {
+  const buffer = Buffer.alloc(1000);
   
-  if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) {
-    throw new Error(`Nieprawidłowa kwota: ${amount} SOL`);
-  }
+  // Instrukcja CreateRoom (0)
+  buffer.writeUInt8(0, 0);
   
-  if (!wallet || !wallet.publicKey || !wallet.signTransaction) {
-    throw new Error('Nieprawidłowy portfel');
-  }
+  // max_players: u8
+  buffer.writeUInt8(maxPlayers, 1);
   
-  const { publicKey, signTransaction } = wallet;
+  // entry_fee_lamports: u64
+  const entryFeeLamports = Math.round(entryFee * LAMPORTS_PER_SOL);
+  buffer.writeBigUInt64LE(BigInt(entryFeeLamports), 2);
   
-  // Konwersja SOL na lamports (1 SOL = 1,000,000,000 lamports)
-  const lamports = Math.round(amount * LAMPORTS_PER_SOL);
+  return buffer.slice(0, 10);
+}
 
-  try {
-    // Tworzenie transakcji
-    const transaction = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: publicKey,
-        toPubkey: PROGRAM_ID,
-        lamports: lamports
-      })
-    );
+function serializeJoinRoomData() {
+  const buffer = Buffer.alloc(1);
+  
+  // Instrukcja JoinRoom (1)
+  buffer.writeUInt8(1, 0);
+  
+  return buffer;
+}
 
-    // Pobierz ostatni blok
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = publicKey;
+function serializeStartGameData(gameId) {
+  const buffer = Buffer.alloc(100);
+  
+  // Instrukcja StartGame (2)
+  buffer.writeUInt8(2, 0);
+  
+  // Długość gameId
+  const gameIdBytes = Buffer.from(gameId, 'utf8');
+  buffer.writeUInt8(gameIdBytes.length, 1);
+  
+  // Zawartość gameId
+  gameIdBytes.copy(buffer, 2);
+  
+  return buffer.slice(0, 2 + gameIdBytes.length);
+}
 
-    // Podpisz transakcję
-    let signedTransaction;
-    try {
-      signedTransaction = await signTransaction(transaction);
-    } catch (signError) {
-      throw new Error(`Błąd podpisu: ${signError.message}`);
-    }
+function serializeEndGameData(winnerPubkey) {
+  const buffer = Buffer.alloc(34);
+  
+  // Instrukcja EndGame (3)
+  buffer.writeUInt8(3, 0);
+  
+  // Winner Pubkey
+  const winnerPubkeyBuffer = winnerPubkey.toBuffer();
+  winnerPubkeyBuffer.copy(buffer, 1);
+  
+  return buffer;
+}
 
-    // Wyślij transakcję
-    const signature = await connection.sendRawTransaction(
-      signedTransaction.serialize()
-    );
+function serializeClaimPrizeData() {
+  const buffer = Buffer.alloc(1);
+  
+  // Instrukcja ClaimPrize (4)
+  buffer.writeUInt8(4, 0);
+  
+  return buffer;
+}
 
-    // Poczekaj na potwierdzenie z timeoutem
-    const confirmationPromise = connection.confirmTransaction({
-      blockhash,
-      lastValidBlockHeight,
-      signature
-    }, 'confirmed');
-    
-    // Dodaj timeout 15 sekund
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Timeout potwierdzenia transakcji')), 15000)
-    );
-    
-    // Wyścig między potwierdzeniem a timeoutem
-    const confirmation = await Promise.race([confirmationPromise, timeoutPromise]);
-    
-    if (confirmation.value && confirmation.value.err) {
-      throw new Error(`Transakcja odrzucona: ${JSON.stringify(confirmation.value.err)}`);
-    }
+function serializeCancelRoomData() {
+  const buffer = Buffer.alloc(1);
+  
+  // Instrukcja CancelRoom (5)
+  buffer.writeUInt8(5, 0);
+  
+  return buffer;
+}
 
-    console.log("Transaction confirmed:", signature);
-    return signature;
-  } catch (error) {
-    console.error('Transaction error:', error);
-    throw new Error(`Błąd transakcji: ${error.message}`);
-  }
+// Znajdź adres PDA dla pokoju gry
+async function findGamePDA(creatorPubkey) {
+  return await PublicKey.findProgramAddress(
+    [Buffer.from('uno_game'), creatorPubkey.toBuffer()],
+    PROGRAM_ID
+  );
 }
 
 // Funkcja do pobrania listy pokojów
 export async function getRooms() {
-  console.log("Getting rooms list");
+  console.log("Getting rooms list from server and blockchain");
   try {
-    const roomsCollection = collection(db, 'rooms');
-    // Zmiana zapytania - pobieramy tylko aktywne pokoje bez zwycięzcy
-    const roomsQuery = query(
-      roomsCollection, 
-      where("isActive", "==", true),
-      where("winner", "==", null)
-    );
-    const roomsSnapshot = await getDocs(roomsQuery);
+    // Pobierz pokoje przez API serwera
+    const response = await fetch(`${GAME_SERVER_URL}/api/rooms`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
     
-    console.log("Rooms found:", roomsSnapshot.docs.length);
+    const rooms = await response.json();
+    console.log("Rooms found:", rooms.length);
     
-    return roomsSnapshot.docs.map(doc => {
-      const data = doc.data();
-      return {
-        id: doc.id,
-        creatorAddress: data.creatorAddress,
-        maxPlayers: data.maxPlayers,
-        currentPlayers: data.players.length,
-        entryFee: data.entryFee,
-        pool: data.entryFee * data.players.length,
-        gameStarted: data.gameStarted
-      };
-    });
+    return rooms;
   } catch (error) {
     console.error('Error getting rooms:', error);
     return [];
@@ -129,50 +129,82 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
   console.log("Creating room with:", { maxPlayers, entryFee });
   console.log("Wallet:", wallet);
   
-  const { publicKey } = wallet;
+  const { publicKey, signTransaction } = wallet;
   
   if (!publicKey) {
     throw new Error('Portfel nie jest połączony');
   }
 
-  const roomData = {
-    creatorAddress: publicKey.toString(),
-    maxPlayers,
-    entryFee,
-    players: [publicKey.toString()],
-    gameStarted: false,
-    winner: null,
-    createdAt: new Date().toISOString(),
-    isActive: true // Dodane pole isActive
-  };
-
   try {
-    // Symulacja transakcji wpisowego od twórcy pokoju
-    console.log("Simulating transaction for room creation");
-    await simulateTransaction(entryFee, wallet);
+    // Znajdź adres PDA dla pokoju
+    const [gamePDA, bump] = await findGamePDA(publicKey);
+    console.log("Game PDA:", gamePDA.toString());
     
-    // Dodanie pokoju do Firestore
-    console.log("Adding room to Firestore");
-    const docRef = await addDoc(collection(db, 'rooms'), roomData);
-    console.log("Room created with ID:", docRef.id);
+    // Serializuj dane instrukcji
+    const data = serializeCreateRoomData(maxPlayers, entryFee);
     
-    // Inicjalizacja stanu gry
-    console.log("Initializing game state");
-    await setDoc(doc(db, 'gameStates', docRef.id), {
-      deck: createAndShuffleDeck(),
-      playerHands: {
-        [publicKey.toString()]: []
-      },
-      currentCard: null,
-      currentPlayerIndex: 0,
-      direction: 1,
-      lastAction: null,
-      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
-      gameStarted: false
+    // Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: publicKey, isSigner: true, isWritable: true },
+        { pubkey: gamePDA, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: PublicKey.default, isSigner: false, isWritable: false }, // Rent sysvar
+      ],
+      programId: PROGRAM_ID,
+      data: data
     });
     
-    console.log("Room creation completed");
-    return docRef.id;
+    // Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // Podpisz transakcję
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
+    
+    // Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    
+    // Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("Room creation transaction confirmed:", signature);
+    
+    // Zarejestruj pokój na serwerze
+    const serverRegistration = await fetch(`${GAME_SERVER_URL}/api/rooms`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        creatorAddress: publicKey.toString(),
+        maxPlayers,
+        entryFee,
+        roomAddress: gamePDA.toString()
+      }),
+    });
+    
+    if (!serverRegistration.ok) {
+      throw new Error(`Server error: ${serverRegistration.status}`);
+    }
+    
+    const roomData = await serverRegistration.json();
+    console.log("Room registered on server:", roomData);
+    
+    return roomData.roomId;
   } catch (error) {
     console.error('Error creating room:', error);
     throw error;
@@ -202,93 +234,73 @@ export async function joinRoom(roomId, entryFee, wallet) {
   }
 
   try {
-    // 1. Pobierz dane pokoju
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
+    // 1. Pobierz dane pokoju z serwera
+    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!roomResponse.ok) {
+      throw new Error(`Server error: ${roomResponse.status}`);
     }
     
-    const roomData = roomSnap.data();
+    const roomData = await roomResponse.json();
+    console.log("Room data from server:", roomData);
     
-    // 2. Sprawdź, czy gracz już jest w pokoju
-    if (roomData.players.includes(publicKey.toString())) {
-      console.log("Player already in room");
-      return true; // Już jesteś w tym pokoju
-    }
+    // 2. Pobierz adres PDA pokoju
+    const roomPDA = new PublicKey(roomData.roomAddress);
     
-    // 3. Walidacja
-    if (roomData.players.length >= roomData.maxPlayers) {
-      throw new Error('Pokój jest pełny');
-    }
+    // 3. Serializuj dane instrukcji
+    const data = serializeJoinRoomData();
     
-    if (roomData.gameStarted) {
-      throw new Error('Gra już się rozpoczęła');
-    }
-
-    // 4. Najpierw zapisz gracza do pokoju (ważne, żeby zrobić to przed transakcją)
-    console.log("Adding player to room:", publicKey.toString());
-    await updateDoc(roomRef, {
-      players: arrayUnion(publicKey.toString())
+    // 4. Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: publicKey, isSigner: true, isWritable: true },
+        { pubkey: roomPDA, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      programId: PROGRAM_ID,
+      data: data
     });
     
-    // 5. Transakcja wpisowego
-    console.log("Simulating transaction for entry fee:", entryFee);
+    // 5. Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // 6. Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // 7. Podpisz transakcję
+    let signedTransaction;
     try {
-      await simulateTransaction(entryFee, wallet);
-    } catch (txError) {
-      // W przypadku błędu transakcji, usuń gracza z pokoju
-      try {
-        const updatedRoomData = { 
-          players: roomData.players.filter(p => p !== publicKey.toString()) 
-        };
-        await updateDoc(roomRef, updatedRoomData);
-      } catch (cleanupError) {
-        console.error("Error cleaning up after failed transaction:", cleanupError);
-      }
-      throw txError;
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
     }
     
-    // 6. Dodaj gracza do stanu gry
-    console.log("Adding player to game state");
-    try {
-      const gameStateRef = doc(db, 'gameStates', roomId);
-      const gameStateSnap = await getDoc(gameStateRef);
-      
-      if (gameStateSnap.exists()) {
-        const gameState = gameStateSnap.data();
-        
-        // Przygotuj aktualizację ręki gracza
-        const updatedPlayerHands = { ...gameState.playerHands };
-        updatedPlayerHands[publicKey.toString()] = [];
-        
-        await updateDoc(gameStateRef, {
-          playerHands: updatedPlayerHands
-        });
-      }
-    } catch (gameStateError) {
-      console.error("Error updating game state:", gameStateError);
-      // Kontynuujemy mimo błędu, bo gracz i tak jest już w pokoju
-    }
+    // 8. Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
     
-    // 7. Sprawdź, czy pokój jest pełny - rozpocznij grę, jeśli tak
-    try {
-      const updatedRoomSnap = await getDoc(roomRef);
-      const updatedRoomData = updatedRoomSnap.data();
-      
-      if (updatedRoomData.players.length >= updatedRoomData.maxPlayers) {
-        console.log("Room is full, starting game");
-        await updateDoc(roomRef, {
-          gameStarted: true
-        });
-        
-        // Inicjalizacja gry
-        await initializeGameState(roomId);
-      }
-    } catch (startGameError) {
-      console.error("Error starting game:", startGameError);
-      // Nie przerywa, dołączanie i tak już zakończone
+    // 9. Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("Join room transaction confirmed:", signature);
+    
+    // 10. Powiadom serwer o dołączeniu gracza
+    const joinResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/join`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        playerAddress: publicKey.toString()
+      }),
+    });
+    
+    if (!joinResponse.ok) {
+      throw new Error(`Server error: ${joinResponse.status}`);
     }
     
     console.log("Join room completed successfully");
@@ -299,7 +311,7 @@ export async function joinRoom(roomId, entryFee, wallet) {
   }
 }
 
-// Funkcja do opuszczenia gry (nowa)
+// Funkcja do opuszczania gry
 export async function leaveGame(roomId, wallet) {
   console.log("Player is leaving game:", roomId);
   try {
@@ -309,72 +321,30 @@ export async function leaveGame(roomId, wallet) {
       throw new Error('Portfel nie jest połączony');
     }
     
-    const playerAddress = publicKey.toString();
+    // Powiadom serwer o opuszczeniu pokoju
+    const leaveResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/leave`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        playerAddress: publicKey.toString()
+      }),
+    });
     
-    // Pobierz dane pokoju
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
+    if (!leaveResponse.ok) {
+      throw new Error(`Server error: ${leaveResponse.status}`);
     }
     
-    const roomData = roomSnap.data();
+    const result = await leaveResponse.json();
     
-    // Sprawdź, czy gracz jest w pokoju
-    if (!roomData.players.includes(playerAddress)) {
-      throw new Error('Nie jesteś uczestnikiem tej gry');
+    // Jeśli gra była w toku i jest inny gracz, zakończ grę na łańcuchu
+    if (result.wasActive && result.opponentWins) {
+      await endGame(roomId, result.opponentAddress, wallet);
     }
     
-    // Sprawdź, czy gra jest w toku
-    if (!roomData.gameStarted || roomData.winner) {
-      // Jeśli gra się nie rozpoczęła lub już się zakończyła, po prostu usuń gracza
-      const updatedPlayers = roomData.players.filter(p => p !== playerAddress);
-      
-      if (updatedPlayers.length === 0) {
-        // Jeśli to był ostatni gracz, oznacz pokój jako nieaktywny
-        await updateDoc(roomRef, {
-          players: updatedPlayers,
-          isActive: false,
-          endedAt: new Date().toISOString()
-        });
-      } else {
-        await updateDoc(roomRef, {
-          players: updatedPlayers
-        });
-      }
-      
-      return { success: true, message: 'Opuszczono pokój' };
-    }
-    
-    // Jeśli gra jest w toku, przeciwnik wygrywa
-    const opponentAddress = roomData.players.find(p => p !== playerAddress);
-    
-    if (opponentAddress) {
-      // Ustaw przeciwnika jako zwycięzcę
-      await updateDoc(roomRef, {
-        winner: opponentAddress,
-        endReason: 'player_left',
-        isActive: false,
-        endedAt: new Date().toISOString()
-      });
-      
-      // Zaktualizuj stan gry
-      const gameStateRef = doc(db, 'gameStates', roomId);
-      await updateDoc(gameStateRef, {
-        lastAction: {
-          player: playerAddress,
-          action: 'leave',
-          timestamp: new Date().toISOString(),
-          result: 'opponent_win'
-        }
-      });
-      
-      return { 
-        success: true, 
-        message: 'Przeciwnik wygrywa przez walkower', 
-        opponentWins: true 
-      };
+    if (socket) {
+      socket.disconnect();
     }
     
     return { success: true, message: 'Opuszczono pokój' };
@@ -384,132 +354,18 @@ export async function leaveGame(roomId, wallet) {
   }
 }
 
-async function initializeGameState(roomId) {
-  console.log("Initializing game state for room:", roomId);
-  try {
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      console.error("Room not found for game initialization");
-      return;
-    }
-    
-    const roomData = roomSnap.data();
-    const gameStateRef = doc(db, 'gameStates', roomId);
-    const gameStateSnap = await getDoc(gameStateRef);
-    
-    if (!gameStateSnap.exists()) {
-      console.error("Game state not found for initialization");
-      return;
-    }
-    
-    // Utwórz nową talię kart
-    const deck = createAndShuffleDeck();
-    console.log("Deck created with", deck.length, "cards");
-    
-    // Rozdaj karty graczom - WAŻNE: upewnij się, że każdy gracz otrzymuje karty
-    const playerHands = {};
-    
-    for (const playerAddress of roomData.players) {
-      playerHands[playerAddress] = [];
-      for (let i = 0; i < 7; i++) {
-        if (deck.length > 0) {
-          playerHands[playerAddress].push(deck.pop());
-        }
-      }
-      console.log("Dealt", playerHands[playerAddress].length, "cards to player", playerAddress);
-    }
-    
-    // Wyłóż pierwszą kartę na stół
-    let currentCard = null;
-    if (deck.length > 0) {
-      currentCard = deck.pop();
-      
-      // Jeśli pierwsza karta to Wild lub Wild4, wybierz losowo kolor
-      if (currentCard.color === 'black') {
-        const colors = ['red', 'blue', 'green', 'yellow'];
-        const randomColor = colors[Math.floor(Math.random() * colors.length)];
-        currentCard = { ...currentCard, color: randomColor };
-        console.log("First card was Wild, changed color to:", randomColor);
-      }
-    }
-    
-    console.log("First card on table:", currentCard);
-    
-    // Aktualizacja stanu gry
-    await updateDoc(gameStateRef, {
-      deck,
-      playerHands,
-      currentCard,
-      currentPlayerIndex: 0,
-      direction: 1,
-      gameStarted: true,
-      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
-      lastAction: {
-        action: 'start',
-        player: roomData.players[0],
-        timestamp: new Date().toISOString()
-      }
-    });
-    
-    console.log("Game state initialized successfully");
-  } catch (error) {
-    console.error("Error initializing game state:", error);
-  }
-}
-
-// Funkcja do utworzenia i potasowania talii kart UNO
-function createAndShuffleDeck() {
-  const colors = ['red', 'blue', 'green', 'yellow'];
-  const values = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'Skip', 'Reverse', 'Draw2'];
-  
-  let deck = [];
-
-  // Dodajemy karty kolorowe
-  for (const color of colors) {
-    for (const value of values) {
-      deck.push({ color, value });
-      
-      // Dodajemy drugą kartę każdego typu, z wyjątkiem 0
-      if (value !== '0') {
-        deck.push({ color, value });
-      }
-    }
-  }
-
-  // Dodajemy karty specjalne Wild i Wild Draw 4
-  for (let i = 0; i < 4; i++) {
-    deck.push({ color: 'black', value: 'Wild' });
-    deck.push({ color: 'black', value: 'Wild4' });
-  }
-
-  // Tasujemy talię
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-
-  return deck;
-}
-
 // Funkcja do pobrania informacji o pokoju
 export async function getRoomInfo(roomId) {
   console.log("Getting room info for room:", roomId);
   
   try {
-    const roomRef = doc(db, 'rooms', roomId);
-    console.log("Room reference:", roomRef);
-    
-    const roomSnap = await getDoc(roomRef);
-    console.log("Room snapshot exists:", roomSnap.exists());
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
+    const response = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!response.ok) {
+      throw new Error(`Server error: ${response.status}`);
     }
     
-    const roomData = roomSnap.data();
-    console.log("Room data:", roomData);
+    const roomData = await response.json();
+    console.log("Room data from server:", roomData);
     
     return {
       id: roomId,
@@ -522,7 +378,7 @@ export async function getRoomInfo(roomId) {
       gameStarted: roomData.gameStarted,
       winner: roomData.winner,
       createdAt: roomData.createdAt,
-      isActive: roomData.isActive === true, // Jawne porównanie, aby uniknąć wartości undefined
+      isActive: roomData.isActive,
       endedAt: roomData.endedAt
     };
   } catch (error) {
@@ -531,401 +387,186 @@ export async function getRoomInfo(roomId) {
   }
 }
 
-// Funkcja do pobrania stanu gry dla gracza
-export async function getGameState(roomId, wallet) {
-  console.log("Getting game state for room:", roomId);
-  try {
-    const { publicKey } = wallet;
-    
-    if (!publicKey) {
-      throw new Error('Portfel nie jest połączony');
-    }
-    
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
-    }
-    
-    const roomData = roomSnap.data();
-    const playerAddress = publicKey.toString();
-    
-    if (!roomData.players.includes(playerAddress)) {
-      throw new Error('Nie jesteś uczestnikiem tej gry');
-    }
-    
-    const gameStateRef = doc(db, 'gameStates', roomId);
-    const gameStateSnap = await getDoc(gameStateRef);
-    
-    if (!gameStateSnap.exists()) {
-      throw new Error('Stan gry nie istnieje');
-    }
-    
-    const gameState = gameStateSnap.data();
-    
-    // Zwróć stan gry z perspektywy danego gracza
-    const playerState = {
-      currentCard: gameState.currentCard,
-      playerHand: gameState.playerHands[playerAddress] || [],
-      currentPlayerIndex: Number(gameState.currentPlayerIndex),
-      playerIndex: Number(roomData.players.indexOf(playerAddress)),
-      playersCount: roomData.players.length,
-      direction: gameState.direction,
-      deckSize: gameState.deck.length,
-      turnStartTime: gameState.turnStartTime, // Dodane pole turnStartTime
-      otherPlayersCardCount: roomData.players.reduce((acc, addr) => {
-        if (addr !== playerAddress) {
-          acc[addr] = (gameState.playerHands[addr] || []).length;
-        }
-        return acc;
-      }, {}),
-      lastAction: gameState.lastAction,
-      winner: roomData.winner
-    };
-    
-    console.log("Player state:", playerState);
-    return playerState;
-  } catch (error) {
-    console.error('Error getting game state:', error);
-    throw error;
+// Funkcja rozpoczynająca grę on-chain
+export async function startGame(roomId, wallet) {
+  console.log("Starting game for room:", roomId);
+  
+  const { publicKey, signTransaction } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
   }
-}
-
-// Funkcja do zagrania karty
-export async function playCard(roomId, cardIndex, chosenColor = null, wallet) {
-  console.log("Playing card:", { roomId, cardIndex, chosenColor });
+  
   try {
-    const { publicKey } = wallet;
-    
-    if (!publicKey) {
-      throw new Error('Portfel nie jest połączony');
+    // 1. Pobierz dane pokoju z serwera
+    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!roomResponse.ok) {
+      throw new Error(`Server error: ${roomResponse.status}`);
     }
     
-    const playerAddress = publicKey.toString();
+    const roomData = await roomResponse.json();
+    console.log("Room data from server:", roomData);
     
-    // Pobierz dane pokoju
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
+    // 2. Wygeneruj unikalny identyfikator gry
+    const gameId = `game_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
     
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
-    }
+    // 3. Pobierz adres PDA pokoju
+    const roomPDA = new PublicKey(roomData.roomAddress);
     
-    const roomData = roomSnap.data();
-    const playerIndex = roomData.players.indexOf(playerAddress);
+    // 4. Serializuj dane instrukcji
+    const data = serializeStartGameData(gameId);
     
-    if (playerIndex === -1) {
-      throw new Error('Nie jesteś uczestnikiem tej gry');
-    }
-    
-    // Pobierz stan gry
-    const gameStateRef = doc(db, 'gameStates', roomId);
-    const gameStateSnap = await getDoc(gameStateRef);
-    
-    if (!gameStateSnap.exists()) {
-      throw new Error('Stan gry nie istnieje');
-    }
-    
-    const gameState = gameStateSnap.data();
-    
-    if (gameState.currentPlayerIndex !== playerIndex) {
-      throw new Error('Nie jest twoja kolej');
-    }
-    
-    const playerHand = gameState.playerHands[playerAddress];
-    
-    if (!playerHand || cardIndex < 0 || cardIndex >= playerHand.length) {
-      throw new Error('Nieprawidłowy indeks karty');
-    }
-    
-    const card = playerHand[cardIndex];
-    
-    // Sprawdź, czy karta może być zagrana
-    if (!isValidMove(card, gameState.currentCard)) {
-      throw new Error('Nieprawidłowy ruch');
-    }
-    
-    // Usuń kartę z ręki gracza
-    const playedCard = playerHand.splice(cardIndex, 1)[0];
-    
-    // Aktualizuj bieżącą kartę
-    let updatedCard = { ...playedCard };
-    
-    // Jeśli karta to Wild lub Wild4, ustaw wybrany kolor
-    if (playedCard.color === 'black' && chosenColor) {
-      if (['red', 'blue', 'green', 'yellow'].includes(chosenColor)) {
-        updatedCard = { ...playedCard, color: chosenColor };
-      }
-    }
-    
-    // Przygotuj aktualizację stanu gry
-    const gameStateUpdate = {
-      playerHands: { ...gameState.playerHands },
-      currentCard: updatedCard,
-      lastAction: {
-        player: playerAddress,
-        action: 'play',
-        card: playedCard,
-        timestamp: new Date().toISOString()
-      }
-    };
-    
-    // Zaktualizuj rękę gracza
-    gameStateUpdate.playerHands[playerAddress] = playerHand;
-    
-    // Obsłuż efekty specjalnych kart
-    const specialCardEffects = handleSpecialCardEffects(
-      roomData.players,
-      gameState,
-      playedCard,
-      playerIndex
-    );
-    
-    // Połącz aktualizacje
-    Object.assign(gameStateUpdate, specialCardEffects);
-    
-    // Dodaj czas rozpoczęcia tury następnego gracza
-    gameStateUpdate.turnStartTime = new Date().toISOString();
-    
-    // Sprawdź, czy gracz wygrał
-    if (playerHand.length === 0) {
-      // Aktualizuj pokój - ustaw zwycięzcę i oznacz jako nieaktywny
-      await updateDoc(roomRef, {
-        winner: playerAddress,
-        isActive: false,
-        endedAt: new Date().toISOString()
-      });
-      
-      gameStateUpdate.lastAction.result = 'win';
-      
-      // Aktualizuj stan gry
-      await updateDoc(gameStateRef, gameStateUpdate);
-      
-      return { winner: playerAddress };
-    }
-    
-    // Aktualizuj stan gry
-    await updateDoc(gameStateRef, gameStateUpdate);
-    
-    return true;
-  } catch (error) {
-    console.error('Error playing card:', error);
-    throw error;
-  }
-}
-
-// Funkcja do dobierania karty
-export async function drawCard(roomId, wallet) {
-  console.log("Drawing card from room:", roomId);
-  try {
-    const { publicKey } = wallet;
-    
-    if (!publicKey) {
-      throw new Error('Portfel nie jest połączony');
-    }
-    
-    const playerAddress = publicKey.toString();
-    
-    // Pobierz dane pokoju
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
-    }
-    
-    const roomData = roomSnap.data();
-    const playerIndex = roomData.players.indexOf(playerAddress);
-    
-    if (playerIndex === -1) {
-      throw new Error('Nie jesteś uczestnikiem tej gry');
-    }
-    
-    // Pobierz stan gry
-    const gameStateRef = doc(db, 'gameStates', roomId);
-    const gameStateSnap = await getDoc(gameStateRef);
-    
-    if (!gameStateSnap.exists()) {
-      throw new Error('Stan gry nie istnieje');
-    }
-    
-    const gameState = gameStateSnap.data();
-    
-    if (gameState.currentPlayerIndex !== playerIndex) {
-      throw new Error('Nie jest twoja kolej');
-    }
-    
-    // Sprawdź, czy w talii są jeszcze karty
-    if (gameState.deck.length === 0) {
-      throw new Error('Brak kart w talii');
-    }
-    
-    // Pobierz kartę z talii
-    const drawnCard = gameState.deck.pop();
-    
-    // Dodaj kartę do ręki gracza
-    const playerHand = gameState.playerHands[playerAddress] || [];
-    playerHand.push(drawnCard);
-    
-    // Przygotuj aktualizację stanu gry
-    const updatedPlayerHands = { ...gameState.playerHands };
-    updatedPlayerHands[playerAddress] = playerHand;
-    
-    // Oblicz następnego gracza
-    const nextPlayerIndex = getNextPlayerIndex(
-      roomData.players.length,
-      gameState.currentPlayerIndex,
-      gameState.direction
-    );
-    
-    // Aktualizuj stan gry
-    await updateDoc(gameStateRef, {
-      deck: gameState.deck,
-      playerHands: updatedPlayerHands,
-      currentPlayerIndex: nextPlayerIndex,
-      turnStartTime: new Date().toISOString(), // Dodane pole turnStartTime
-      lastAction: {
-        player: playerAddress,
-        action: 'draw',
-        timestamp: new Date().toISOString()
-      }
+    // 5. Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: publicKey, isSigner: true, isWritable: true },
+        { pubkey: roomPDA, isSigner: false, isWritable: true },
+      ],
+      programId: PROGRAM_ID,
+      data: data
     });
     
-    console.log("Card drawn successfully");
-    return drawnCard;
+    // 6. Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // 7. Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // 8. Podpisz transakcję
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
+    
+    // 9. Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    
+    // 10. Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("Start game transaction confirmed:", signature);
+    
+    // 11. Powiadom serwer o rozpoczęciu gry
+    const startResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        gameId,
+        initiatorAddress: publicKey.toString()
+      }),
+    });
+    
+    if (!startResponse.ok) {
+      throw new Error(`Server error: ${startResponse.status}`);
+    }
+    
+    // 12. Połącz z serwerem gry przez WebSocket
+    await connectToGameServer(roomId, gameId, publicKey.toString());
+    
+    console.log("Game started successfully");
+    return gameId;
   } catch (error) {
-    console.error('Error drawing card:', error);
+    console.error('Error starting game:', error);
     throw error;
   }
 }
 
-// Funkcja do sprawdzania, czy ruch jest prawidłowy
-function isValidMove(card, currentCard) {
-  // Karta Wild lub Wild4 zawsze może być zagrana
-  if (card.color === 'black') {
-    return true;
+// Funkcja kończąca grę on-chain
+export async function endGame(roomId, winnerAddress, wallet) {
+  console.log("Ending game:", { roomId, winnerAddress });
+  
+  const { publicKey, signTransaction } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
   }
   
-  // Zgodność koloru lub wartości
-  return (
-    card.color === currentCard.color || 
-    card.value === currentCard.value
-  );
-}
-
-// Funkcja do obsługi efektów kart specjalnych
-function handleSpecialCardEffects(players, gameState, card, playerIndex) {
-  const updates = {};
-  let nextPlayerIndex = getNextPlayerIndex(
-    players.length,
-    playerIndex,
-    gameState.direction
-  );
-  
-  switch (card.value) {
-    case 'Skip':
-      // Pomiń następnego gracza
-      nextPlayerIndex = getNextPlayerIndex(
-        players.length,
-        nextPlayerIndex,
-        gameState.direction
-      );
-      updates.currentPlayerIndex = nextPlayerIndex;
-      break;
-      
-    case 'Reverse':
-      // Zmień kierunek gry
-      updates.direction = gameState.direction * -1;
-      
-      // Jeśli jest tylko 2 graczy, działa jak Skip
-      if (players.length === 2) {
-        // Nie zmieniaj bieżącego gracza
-        updates.currentPlayerIndex = playerIndex;
-      } else {
-        // Zmień gracza zgodnie z nowym kierunkiem
-        nextPlayerIndex = getNextPlayerIndex(
-          players.length,
-          playerIndex,
-          updates.direction
-        );
-        updates.currentPlayerIndex = nextPlayerIndex;
-      }
-      break;
-      
-    case 'Draw2':
-      // Następny gracz dobiera 2 karty
-      const nextPlayerDraw2Address = players[nextPlayerIndex];
-      const nextPlayerDraw2Hand = gameState.playerHands[nextPlayerDraw2Address] || [];
-      
-      for (let i = 0; i < 2; i++) {
-        if (gameState.deck.length > 0) {
-          nextPlayerDraw2Hand.push(gameState.deck.pop());
-        }
-      }
-      
-      const updatedHandsDraw2 = { ...gameState.playerHands };
-      updatedHandsDraw2[nextPlayerDraw2Address] = nextPlayerDraw2Hand;
-      
-      updates.playerHands = updatedHandsDraw2;
-      updates.deck = gameState.deck;
-      
-      // Przejdź o 2 graczy dalej (pomijając gracza, który dobiera karty)
-      nextPlayerIndex = getNextPlayerIndex(
-        players.length,
-        nextPlayerIndex,
-        gameState.direction
-      );
-      updates.currentPlayerIndex = nextPlayerIndex;
-      break;
-      
-    case 'Wild4':
-      // Następny gracz dobiera 4 karty
-      const nextPlayerWild4Address = players[nextPlayerIndex];
-      const nextPlayerWild4Hand = gameState.playerHands[nextPlayerWild4Address] || [];
-      
-      for (let i = 0; i < 4; i++) {
-        if (gameState.deck.length > 0) {
-          nextPlayerWild4Hand.push(gameState.deck.pop());
-        }
-      }
-      
-      const updatedHandsWild4 = { ...gameState.playerHands };
-      updatedHandsWild4[nextPlayerWild4Address] = nextPlayerWild4Hand;
-      
-      updates.playerHands = updatedHandsWild4;
-      updates.deck = gameState.deck;
-      
-      // Przejdź o 2 graczy dalej (pomijając gracza, który dobiera karty)
-      nextPlayerIndex = getNextPlayerIndex(
-        players.length,
-        nextPlayerIndex,
-        gameState.direction
-      );
-      updates.currentPlayerIndex = nextPlayerIndex;
-      break;
-      
-    default:
-      // Dla zwykłych kart, przejdź do następnego gracza
-      updates.currentPlayerIndex = nextPlayerIndex;
-  }
-  
-  return updates;
-}
-
-// Funkcja do obliczenia indeksu następnego gracza
-function getNextPlayerIndex(playersCount, currentIndex, direction) {
-  return (currentIndex + direction + playersCount) % playersCount;
-}
-
-// Funkcja do automatycznego przejścia do następnego gracza po upływie czasu
-export async function autoSkipTurn(roomId, wallet) {
-  console.log("Auto skipping turn due to inactivity");
   try {
-    // Zasadniczo wywołujemy funkcję drawCard, która przesuwa turę
-    return await drawCard(roomId, wallet);
+    // 1. Pobierz dane pokoju z serwera
+    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!roomResponse.ok) {
+      throw new Error(`Server error: ${roomResponse.status}`);
+    }
+    
+    const roomData = await roomResponse.json();
+    console.log("Room data from server:", roomData);
+    
+    // 2. Pobierz adres PDA pokoju
+    const roomPDA = new PublicKey(roomData.roomAddress);
+    
+    // 3. Utwórz PublicKey dla zwycięzcy
+    const winnerPubkey = new PublicKey(winnerAddress);
+    
+    // 4. Serializuj dane instrukcji
+    const data = serializeEndGameData(winnerPubkey);
+    
+    // 5. Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: publicKey, isSigner: true, isWritable: true },
+        { pubkey: roomPDA, isSigner: false, isWritable: true },
+      ],
+      programId: PROGRAM_ID,
+      data: data
+    });
+    
+    // 6. Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // 7. Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // 8. Podpisz transakcję
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
+    
+    // 9. Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    
+    // 10. Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("End game transaction confirmed:", signature);
+    
+    // 11. Powiadom serwer o zakończeniu gry
+    const endResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/end`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        winnerAddress: winnerAddress
+      }),
+    });
+    
+    if (!endResponse.ok) {
+      throw new Error(`Server error: ${endResponse.status}`);
+    }
+    
+    console.log("Game ended successfully");
+    return true;
   } catch (error) {
-    console.error('Error auto skipping turn:', error);
+    console.error('Error ending game:', error);
     throw error;
   }
 }
@@ -933,50 +574,98 @@ export async function autoSkipTurn(roomId, wallet) {
 // Funkcja do odebrania nagrody przez zwycięzcę
 export async function claimPrize(roomId, wallet) {
   console.log("Claiming prize for room:", roomId);
+  
+  const { publicKey, signTransaction } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
   try {
-    const { publicKey } = wallet;
-    
-    if (!publicKey) {
-      throw new Error('Portfel nie jest połączony');
+    // 1. Pobierz dane pokoju z serwera
+    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!roomResponse.ok) {
+      throw new Error(`Server error: ${roomResponse.status}`);
     }
     
-    const playerAddress = publicKey.toString();
+    const roomData = await roomResponse.json();
+    console.log("Room data from server:", roomData);
     
-    // Pobierz dane pokoju
-    const roomRef = doc(db, 'rooms', roomId);
-    const roomSnap = await getDoc(roomRef);
-    
-    if (!roomSnap.exists()) {
-      throw new Error('Pokój nie istnieje');
-    }
-    
-    const roomData = roomSnap.data();
-    
-    if (roomData.winner !== playerAddress) {
+    // 2. Sprawdź, czy gracz jest zwycięzcą
+    if (roomData.winner !== publicKey.toString()) {
       throw new Error('Tylko zwycięzca może odebrać nagrodę');
     }
     
+    // 3. Sprawdź, czy nagroda nie została już odebrana
     if (roomData.prizeClaimedBy) {
       throw new Error('Nagroda została już odebrana');
     }
     
-    // Oblicz nagrodę
-    const prize = roomData.entryFee * roomData.players.length;
+    // 4. Pobierz adres PDA pokoju
+    const roomPDA = new PublicKey(roomData.roomAddress);
     
-    // W rzeczywistej implementacji, przesłalibyśmy SOL do zwycięzcy
-    // Symulujemy to tylko
+    // 5. Serializuj dane instrukcji
+    const data = serializeClaimPrizeData();
     
-    // Oznacz nagrodę jako odebraną i pokój jako zakończony
-    await updateDoc(roomRef, {
-      prizeClaimedBy: playerAddress,
-      prizeClaimedAt: new Date().toISOString(),
-      isActive: false, // Oznacz pokój jako nieaktywny
-      endedAt: new Date().toISOString()
+    // 6. Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: publicKey, isSigner: true, isWritable: true },
+        { pubkey: roomPDA, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      programId: PROGRAM_ID,
+      data: data
     });
+    
+    // 7. Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // 8. Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // 9. Podpisz transakcję
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
+    
+    // 10. Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    
+    // 11. Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("Claim prize transaction confirmed:", signature);
+    
+    // 12. Powiadom serwer o odebraniu nagrody
+    const claimResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/claim`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        claimerAddress: publicKey.toString()
+      }),
+    });
+    
+    if (!claimResponse.ok) {
+      throw new Error(`Server error: ${claimResponse.status}`);
+    }
+    
+    const prize = roomData.entryFee * roomData.players.length;
     
     console.log("Prize claimed successfully:", prize, "SOL");
     return {
-      winner: playerAddress,
+      winner: publicKey.toString(),
       prize,
       claimedAt: new Date().toISOString()
     };
@@ -984,4 +673,310 @@ export async function claimPrize(roomId, wallet) {
     console.error('Error claiming prize:', error);
     throw error;
   }
+}
+
+// Funkcja anulowania pokoju
+export async function cancelRoom(roomId, wallet) {
+  console.log("Cancelling room:", roomId);
+  
+  const { publicKey, signTransaction } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  try {
+    // 1. Pobierz dane pokoju z serwera
+    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
+    if (!roomResponse.ok) {
+      throw new Error(`Server error: ${roomResponse.status}`);
+    }
+    
+    const roomData = await roomResponse.json();
+    console.log("Room data from server:", roomData);
+    
+    // 2. Sprawdź, czy użytkownik jest twórcą pokoju
+    if (roomData.creatorAddress !== publicKey.toString()) {
+      throw new Error('Tylko twórca może anulować pokój');
+    }
+    
+    // 3. Pobierz adres PDA pokoju
+    const roomPDA = new PublicKey(roomData.roomAddress);
+    
+    // 4. Serializuj dane instrukcji
+    const data = serializeCancelRoomData();
+    
+    // 5. Przygotuj listę kluczy do instrukcji
+    const keys = [
+      { pubkey: publicKey, isSigner: true, isWritable: true },
+      { pubkey: roomPDA, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ];
+    
+    // 6. Dodaj klucze dla każdego gracza do zwrotu wpisowego
+    for (const playerAddress of roomData.players) {
+      if (playerAddress !== publicKey.toString()) {
+        keys.push({
+          pubkey: new PublicKey(playerAddress),
+          isSigner: false,
+          isWritable: true
+        });
+      }
+    }
+    
+    // 7. Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys,
+      programId: PROGRAM_ID,
+      data: data
+    });
+    
+    // 8. Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // 9. Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = publicKey;
+    
+    // 10. Podpisz transakcję
+    let signedTransaction;
+    try {
+      signedTransaction = await signTransaction(transaction);
+    } catch (signError) {
+      throw new Error(`Błąd podpisu: ${signError.message}`);
+    }
+    
+    // 11. Wyślij transakcję
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    
+    // 12. Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("Cancel room transaction confirmed:", signature);
+    
+    // 13. Powiadom serwer o anulowaniu pokoju
+    const cancelResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        creatorAddress: publicKey.toString()
+      }),
+    });
+    
+    if (!cancelResponse.ok) {
+      throw new Error(`Server error: ${cancelResponse.status}`);
+    }
+    
+    console.log("Room cancelled successfully");
+    return true;
+  } catch (error) {
+    console.error('Error cancelling room:', error);
+    throw error;
+  }
+}
+
+// ---- FUNKCJE SOCKET.IO DLA GRY W CZASIE RZECZYWISTYM ----
+
+// Połączenie z serwerem gry przez Socket.IO
+export function connectToGameServer(roomId, gameId, playerAddress) {
+  console.log("Connecting to game server:", { roomId, gameId, playerAddress });
+  
+  return new Promise((resolve, reject) => {
+    // Rozłącz poprzednie połączenie, jeśli istnieje
+    if (socket) {
+      socket.disconnect();
+    }
+    
+    // Inicjalizuj nowe połączenie
+    socket = io(GAME_SERVER_URL);
+    
+    // Obsługa zdarzenia połączenia
+    socket.on('connect', () => {
+      console.log("Connected to game server with socket ID:", socket.id);
+      
+      // Dołącz do pokoju
+      socket.emit('join_game', { roomId, gameId, playerAddress });
+      
+      resolve(true);
+    });
+    
+    // Obsługa błędów
+    socket.on('connect_error', (error) => {
+      console.error("Socket.IO connection error:", error);
+      reject(error);
+    });
+    
+    socket.on('error', (error) => {
+      console.error("Socket.IO error:", error);
+      reject(error);
+    });
+  });
+}
+
+// Pobierz stan gry z serwera
+export async function getGameState(roomId, wallet) {
+  console.log("Getting game state for room:", roomId);
+  
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  return new Promise((resolve, reject) => {
+    if (!socket || !socket.connected) {
+      // Jeśli socket nie jest podłączony, spróbuj go ponownie podłączyć
+      fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`)
+        .then(response => response.json())
+        .then(roomData => {
+          connectToGameServer(roomId, roomData.gameId, publicKey.toString())
+            .then(() => {
+              socket.emit('get_game_state', { roomId, playerAddress: publicKey.toString() });
+              socket.once('game_state', (gameState) => {
+                resolve(gameState);
+              });
+            })
+            .catch(error => {
+              reject(error);
+            });
+        })
+        .catch(error => {
+          reject(error);
+        });
+    } else {
+      // Socket jest już podłączony
+      socket.emit('get_game_state', { roomId, playerAddress: publicKey.toString() });
+      socket.once('game_state', (gameState) => {
+        resolve(gameState);
+      });
+    }
+  });
+}
+
+// Nasłuchiwanie na zmiany stanu gry
+export function listenForGameState(roomId, playerAddress, callback) {
+  console.log("Setting up game state listener for:", { roomId, playerAddress });
+  
+  if (!socket || !socket.connected) {
+    console.warn("Socket not connected, game state updates will not be received");
+    return () => {};
+  }
+  
+  const handleGameStateUpdate = (gameState) => {
+    console.log("Game state update received:", gameState);
+    callback(gameState);
+  };
+  
+  socket.on('game_state_update', handleGameStateUpdate);
+  
+  // Zwróć funkcję usuwającą nasłuchiwanie
+  return () => {
+    if (socket) {
+      socket.off('game_state_update', handleGameStateUpdate);
+    }
+  };
+}
+
+// Zagranie karty
+export async function playCard(roomId, cardIndex, chosenColor = null, wallet) {
+  console.log("Playing card:", { roomId, cardIndex, chosenColor });
+  
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  if (!socket || !socket.connected) {
+    throw new Error('Brak połączenia z serwerem gry');
+  }
+  
+  return new Promise((resolve, reject) => {
+    socket.emit('play_card', { 
+      roomId, 
+      playerAddress: publicKey.toString(), 
+      cardIndex, 
+      chosenColor 
+    });
+    
+    socket.once('play_card_result', (result) => {
+      console.log("Play card result:", result);
+      
+      if (result.error) {
+        reject(new Error(result.error));
+      } else {
+        // Sprawdź, czy gra się zakończyła
+        if (result.winner) {
+          // Wywołaj funkcję kończącą grę on-chain
+          endGame(roomId, result.winner, wallet)
+            .then(() => {
+              resolve(result);
+            })
+            .catch(error => {
+              console.error("Error ending game on blockchain:", error);
+              resolve(result); // Mimo błędu, zwróć wynik
+            });
+        } else {
+          resolve(result);
+        }
+      }
+    });
+    
+    // Timeout dla odpowiedzi
+    setTimeout(() => {
+      reject(new Error('Timeout: Brak odpowiedzi od serwera gry'));
+    }, 10000);
+  });
+}
+
+// Dobranie karty
+export async function drawCard(roomId, wallet) {
+  console.log("Drawing card from room:", roomId);
+  
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  if (!socket || !socket.connected) {
+    throw new Error('Brak połączenia z serwerem gry');
+  }
+  
+  return new Promise((resolve, reject) => {
+    socket.emit('draw_card', { 
+      roomId, 
+      playerAddress: publicKey.toString()
+    });
+    
+    socket.once('draw_card_result', (result) => {
+      console.log("Draw card result:", result);
+      
+      if (result.error) {
+        reject(new Error(result.error));
+      } else {
+        resolve(result.card);
+      }
+    });
+    
+    // Timeout dla odpowiedzi
+    setTimeout(() => {
+      reject(new Error('Timeout: Brak odpowiedzi od serwera gry'));
+    }, 10000);
+  });
+}
+
+// Automatyczne pominięcie tury
+export async function autoSkipTurn(roomId, wallet) {
+  console.log("Auto skipping turn due to inactivity:", roomId);
+  
+  // Wywołaj funkcję dobierania karty, która automatycznie przesunie turę
+  return await drawCard(roomId, wallet);
 }

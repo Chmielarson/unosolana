@@ -1,10 +1,19 @@
 // src/components/GameRoom.js
 import React, { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { joinRoom, getRoomInfo, getGameState, playCard, drawCard, claimPrize, leaveGame, autoSkipTurn } from '../utils/SolanaTransactions';
-import { listenForRoom, listenForGameState } from '../firebase';
-import { doc, getDoc } from 'firebase/firestore';
-import { db } from '../firebase';
+import { 
+  getRoomInfo,
+  getGameState,
+  joinRoom,
+  startGame,
+  playCard,
+  drawCard,
+  claimPrize,
+  leaveGame,
+  autoSkipTurn,
+  connectToGameServer,
+  listenForGameState
+} from '../utils/SolanaTransactions';
 
 // Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
 const calculateRemainingTime = (turnStartTime, maxTurnTime) => {
@@ -41,6 +50,9 @@ function GameRoom({ roomId, onBack }) {
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState(0);
   const [turnTimer, setTurnTimer] = useState(0);
   const [maxTurnTime] = useState(30); // 30 sekund na ruch
+  const [isGameInitialized, setIsGameInitialized] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState('disconnected'); // disconnected, connecting, connected
+  const [error, setError] = useState(null);
 
   // Funkcja łącząca ładowanie informacji o pokoju i stanie gry z deduplikacją
   const loadRoomAndGameInfo = useCallback(async (force = false) => {
@@ -59,6 +71,7 @@ function GameRoom({ roomId, onBack }) {
     try {
       console.log("Loading room and game info for room:", roomId);
       setIsRefreshing(true);
+      setError(null);
       setLastUpdateTimestamp(now);
       
       // Załaduj dane pokoju
@@ -80,13 +93,27 @@ function GameRoom({ roomId, onBack }) {
         if (info.gameStarted) {
           setGameStatus('playing');
           
+          // Sprawdź połączenie z serwerem gry
+          if (connectionStatus !== 'connected') {
+            try {
+              setConnectionStatus('connecting');
+              await connectToGameServer(roomId, info.gameId || 'unknown', playerAddr);
+              setConnectionStatus('connected');
+            } catch (connectionError) {
+              console.error("Error connecting to game server:", connectionError);
+              setConnectionStatus('disconnected');
+              setError("Błąd połączenia z serwerem gry. Spróbuj odświeżyć stronę.");
+            }
+          }
+          
           // Załaduj stan gry
           try {
             const state = await getGameState(roomId, wallet);
             console.log("Game state loaded:", state);
             updateGameState(state);
-          } catch (error) {
-            console.error('Error loading game state:', error);
+          } catch (gameStateError) {
+            console.error('Error loading game state:', gameStateError);
+            setError("Błąd ładowania stanu gry. Spróbuj odświeżyć.");
           }
         } else {
           setGameStatus('waiting');
@@ -104,11 +131,12 @@ function GameRoom({ roomId, onBack }) {
       }
     } catch (error) {
       console.error('Error loading room info:', error);
+      setError("Błąd ładowania informacji o pokoju. Spróbuj ponownie.");
     } finally {
       setIsRefreshing(false);
       setIsLoading(false);
     }
-  }, [roomId, publicKey, wallet, isLoading, isRefreshing, onBack, lastUpdateTimestamp]);
+  }, [roomId, publicKey, wallet, isLoading, isRefreshing, onBack, lastUpdateTimestamp, connectionStatus]);
 
   // Efekt inicjalizacyjny - uruchamiany tylko raz przy montowaniu komponentu
   useEffect(() => {
@@ -136,8 +164,21 @@ function GameRoom({ roomId, onBack }) {
         if (playerIdx !== -1) {
           if (info.gameStarted) {
             setGameStatus('playing');
-            const state = await getGameState(roomId, wallet);
-            updateGameState(state);
+            
+            // Połącz z serwerem gry
+            try {
+              setConnectionStatus('connecting');
+              await connectToGameServer(roomId, info.gameId || 'unknown', playerAddr);
+              setConnectionStatus('connected');
+              
+              const state = await getGameState(roomId, wallet);
+              updateGameState(state);
+              setIsGameInitialized(true);
+            } catch (error) {
+              console.error("Error initializing game:", error);
+              setError("Błąd inicjalizacji gry. Spróbuj odświeżyć stronę.");
+              setConnectionStatus('disconnected');
+            }
           } else {
             setGameStatus('waiting');
           }
@@ -155,6 +196,7 @@ function GameRoom({ roomId, onBack }) {
         }
       } catch (error) {
         console.error("Error loading initial data:", error);
+        setError("Błąd ładowania początkowych danych. Spróbuj ponownie.");
       } finally {
         setIsLoading(false);
       }
@@ -163,51 +205,16 @@ function GameRoom({ roomId, onBack }) {
     loadInitialData();
   }, [roomId, publicKey, wallet, onBack]);
   
-  // Efekt do nasłuchiwania zmian - uruchamiany po załadowaniu początkowych danych
+  // Efekt do nasłuchiwania zmian stanu gry
   useEffect(() => {
-    if (!roomId || !publicKey || isLoading) return;
+    if (!roomId || !publicKey || isLoading || !isGameInitialized || connectionStatus !== 'connected') return;
     
-    console.log("Setting up Firebase listeners for room:", roomId);
-    
+    console.log("Setting up game state listeners for room:", roomId);
     const playerAddr = publicKey.toString();
     
-    // Nasłuchiwacz danych pokoju
-    const unsubRoom = listenForRoom(roomId, (updatedRoomData) => {
-      console.log("Room data updated via listener:", updatedRoomData);
-      
-      // Aktualizuj dane pokoju w stanie
-      setRoomInfo(prev => {
-        // Sprawdź czy dane faktycznie się zmieniły
-        if (JSON.stringify(prev) === JSON.stringify(updatedRoomData)) {
-          return prev;
-        }
-        return updatedRoomData;
-      });
-      
-      // Sprawdź czy status gry się zmienił
-      if (updatedRoomData.gameStarted && gameStatus !== 'playing') {
-        console.log("Game status changed to playing");
-        setGameStatus('playing');
-        
-        // Pobierz stan gry, gdy gra się rozpoczyna
-        getGameState(roomId, wallet).then(state => {
-          updateGameState(state);
-        }).catch(error => {
-          console.error("Error loading game state after game start:", error);
-        });
-      }
-      
-      // Sprawdź czy gra się zakończyła
-      if (updatedRoomData.winner) {
-        console.log("Game ended with winner:", updatedRoomData.winner);
-        setWinner(updatedRoomData.winner);
-        setGameStatus('ended');
-      }
-    });
-    
-    // Nasłuchiwacz stanu gry
+    // Nasłuchiwanie zmian stanu gry za pomocą Socket.IO
     const unsubGameState = listenForGameState(roomId, playerAddr, (updatedGameState) => {
-      console.log("Game state updated via listener:", updatedGameState);
+      console.log("Game state updated via socket:", updatedGameState);
       
       // Ważne: ustaw timestamp ostatniej aktualizacji
       setLastUpdateTimestamp(Date.now());
@@ -218,11 +225,10 @@ function GameRoom({ roomId, onBack }) {
     
     // Funkcja czyszcząca nasłuchiwacze
     return () => {
-      console.log("Cleaning up listeners");
-      if (unsubRoom) unsubRoom();
+      console.log("Cleaning up game state listeners");
       if (unsubGameState) unsubGameState();
     };
-  }, [roomId, publicKey, wallet, gameStatus, isLoading]);
+  }, [roomId, publicKey, isLoading, isGameInitialized, connectionStatus]);
 
   // Efekt do odliczania czasu dla aktualnego gracza
   useEffect(() => {
@@ -230,7 +236,8 @@ function GameRoom({ roomId, onBack }) {
     if (
       gameStatus !== 'playing' ||
       currentPlayerIndex !== playerIndex ||
-      !publicKey
+      !publicKey ||
+      connectionStatus !== 'connected'
     ) {
       setTurnTimer(0);
       return;
@@ -294,7 +301,7 @@ function GameRoom({ roomId, onBack }) {
     return () => {
       clearInterval(interval);
     };
-  }, [gameStatus, currentPlayerIndex, playerIndex, publicKey, maxTurnTime, gameState?.turnStartTime]);
+  }, [gameStatus, currentPlayerIndex, playerIndex, publicKey, maxTurnTime, gameState?.turnStartTime, connectionStatus]);
   
   // Efekt do sprawdzania czasu przeciwnika
   useEffect(() => {
@@ -303,7 +310,8 @@ function GameRoom({ roomId, onBack }) {
       currentPlayerIndex === playerIndex ||
       !roomId ||
       !wallet ||
-      !publicKey
+      !publicKey ||
+      connectionStatus !== 'connected'
     ) {
       return;
     }
@@ -332,17 +340,10 @@ function GameRoom({ roomId, onBack }) {
       
       // Jeśli czas się skończył, ale nadal jest tura przeciwnika
       if (currentRemaining <= 0) {
-        console.log("Opponent time's up! Fetching game state to check turn");
+        console.log("Opponent time's up! Refreshing game state");
         
         try {
-          // Sprawdź aktualny stan gry, aby upewnić się, że nadal jest tura przeciwnika
-          const state = await getGameState(roomId, wallet);
-          
-          if (state.currentPlayerIndex !== playerIndex) {
-            // Przeciwnik nie wykonał ruchu w czasie
-            console.log("Opponent didn't make a move in time, refreshing game state");
-            await loadRoomAndGameInfo(true);
-          }
+          await loadRoomAndGameInfo(true);
         } catch (error) {
           console.error("Error checking opponent time:", error);
         }
@@ -350,67 +351,11 @@ function GameRoom({ roomId, onBack }) {
     }, 1000);
     
     return () => clearInterval(interval);
-  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo, maxTurnTime]);
+  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo, connectionStatus, maxTurnTime]);
   
-  // Efekt do automatycznego pominięcia nieaktywnego gracza
+  // Awaryjne odświeżanie co 15 sekund
   useEffect(() => {
-    // Uruchamiamy tylko gdy gra jest aktywna
-    if (gameStatus !== 'playing' || !roomId || !wallet || !publicKey) return;
-    
-    const syncAutoSkip = async () => {
-      try {
-        // Pobierz aktualny stan gry bezpośrednio z bazy
-        const gameStateRef = doc(db, 'gameStates', roomId);
-        const gameStateSnap = await getDoc(gameStateRef);
-        
-        if (!gameStateSnap.exists()) return;
-        
-        const serverGameState = gameStateSnap.data();
-        const roomRef = doc(db, 'rooms', roomId);
-        const roomSnap = await getDoc(roomRef);
-        
-        if (!roomSnap.exists()) return;
-        
-        const roomData = roomSnap.data();
-        
-        // Sprawdź, czy czas na ruch się skończył
-        if (serverGameState.turnStartTime) {
-          const remainingTime = calculateRemainingTime(serverGameState.turnStartTime, maxTurnTime);
-          
-          // Jeśli przekroczono czas o ponad 5 sekund i nadal jest ten sam gracz
-          if (remainingTime <= -5) {
-            const currentPlayerAddress = roomData.players[serverGameState.currentPlayerIndex];
-            console.log("Turn time exceeded by more than 5 seconds for player:", currentPlayerAddress);
-            
-            // Jeśli to nasza tura - wywołaj dobieranie karty
-            if (currentPlayerAddress === publicKey.toString()) {
-              console.log("Auto-skip our turn");
-              await handleDrawCard();
-            } 
-            // Jeśli to nie nasza tura, ale jesteśmy w pokoju, próbujemy odświeżyć stan gry
-            else if (roomData.players.includes(publicKey.toString())) {
-              console.log("Force refresh due to inactive opponent");
-              await loadRoomAndGameInfo(true);
-            }
-          }
-        }
-      } catch (error) {
-        console.error("Error in auto-skip check:", error);
-      }
-    };
-    
-    // Wykonaj pierwsze sprawdzenie po załadowaniu
-    syncAutoSkip();
-    
-    // Sprawdzaj co 5 sekund
-    const interval = setInterval(syncAutoSkip, 5000);
-    
-    return () => clearInterval(interval);
-  }, [gameStatus, roomId, wallet, publicKey, maxTurnTime, loadRoomAndGameInfo]);
-  
-  // Awaryjne odświeżanie co 10 sekund
-  useEffect(() => {
-    if (gameStatus !== 'playing' || !roomId || !wallet) return;
+    if (gameStatus !== 'playing' || !roomId || !wallet || connectionStatus !== 'connected') return;
     
     console.log("Setting up backup refresh interval");
     
@@ -422,13 +367,13 @@ function GameRoom({ roomId, onBack }) {
       } catch (error) {
         console.error("Error in backup refresh:", error);
       }
-    }, 10000);
+    }, 15000);
     
     return () => {
       console.log("Cleaning up backup refresh");
       clearInterval(interval);
     };
-  }, [roomId, wallet, gameStatus]);
+  }, [roomId, wallet, gameStatus, connectionStatus]);
 
   // Usprawniona funkcja aktualizacji stanu gry
   const updateGameState = (state) => {
@@ -480,6 +425,7 @@ function GameRoom({ roomId, onBack }) {
     
     try {
       setIsLoading(true);
+      setError(null);
       console.log("Joining room:", roomId);
 
       if (!roomInfo) {
@@ -521,24 +467,56 @@ function GameRoom({ roomId, onBack }) {
         
         setGameStatus('waiting');
         
-        // Ręczne odświeżenie po 1 sekundzie
+        // Ręczne odświeżenie po 2 sekundach
         setTimeout(async () => {
           try {
-            const updatedInfo = await getRoomInfo(roomId);
-            setRoomInfo(updatedInfo);
-            const playerIdx = updatedInfo.players.indexOf(playerAddr);
-            setPlayerIndex(playerIdx);
+            await loadRoomAndGameInfo(true);
           } catch (refreshError) {
             console.error("Error refreshing room info:", refreshError);
           }
-        }, 1000);
+        }, 2000);
       } catch (joinError) {
         console.error("Error in joinRoom:", joinError);
         throw joinError;
       }
     } catch (error) {
       console.error('Error joining room:', error);
-      alert(`Błąd podczas dołączania do pokoju: ${error.message}`);
+      setError(`Błąd podczas dołączania do pokoju: ${error.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Rozpoczęcie gry
+  const handleStartGame = async () => {
+    if (!publicKey || !roomInfo || gameStatus !== 'waiting') {
+      return;
+    }
+    
+    try {
+      setIsLoading(true);
+      setError(null);
+      console.log("Starting game for room:", roomId);
+      
+      // Sprawdź, czy jest wystarczająca liczba graczy
+      if (roomInfo.players.length < 2) {
+        throw new Error('Potrzeba co najmniej 2 graczy, aby rozpocząć grę');
+      }
+      
+      // Wywołaj funkcję startGame, która zapoczątkuje grę on-chain i połączy z serwerem
+      const gameId = await startGame(roomId, wallet);
+      console.log("Game started with ID:", gameId);
+      
+      setConnectionStatus('connected');
+      setIsGameInitialized(true);
+      setGameStatus('playing');
+      
+      // Odśwież stan gry
+      await loadRoomAndGameInfo(true);
+    } catch (error) {
+      console.error('Error starting game:', error);
+      setError(`Błąd podczas rozpoczynania gry: ${error.message}`);
+      setConnectionStatus('disconnected');
     } finally {
       setIsLoading(false);
     }
@@ -548,7 +526,8 @@ function GameRoom({ roomId, onBack }) {
   const handlePlayCard = async (cardIndex) => {
     if (
       gameStatus !== 'playing' ||
-      currentPlayerIndex !== playerIndex
+      currentPlayerIndex !== playerIndex ||
+      connectionStatus !== 'connected'
     ) {
       // Nie twoja kolej lub gra nie jest aktywna
       return;
@@ -586,6 +565,7 @@ function GameRoom({ roomId, onBack }) {
     // Zwykła karta
     try {
       setIsLoading(true);
+      setError(null);
       
       // Symuluj efekt zagrania karty - usuń ją z ręki natychmiast w UI
       setPlayerHand(prev => {
@@ -594,14 +574,17 @@ function GameRoom({ roomId, onBack }) {
         return updatedHand;
       });
       
-      // Wywołaj funkcję zagrania karty
-      await playCard(roomId, cardIndex, null, wallet);
+      // Wywołaj funkcję zagrania karty przez Socket.IO
+      const result = await playCard(roomId, cardIndex, null, wallet);
+      console.log("Play card result:", result);
       
-      // Wymuszenie odświeżenia po zagraniu karty
-      await loadRoomAndGameInfo(true);
+      // Odśwież stan gry, jeśli to konieczne
+      if (result.winner || result.error) {
+        await loadRoomAndGameInfo(true);
+      }
     } catch (error) {
       console.error('Error playing card:', error);
-      alert('Błąd podczas zagrywania karty: ' + error.message);
+      setError(`Błąd podczas zagrywania karty: ${error.message}`);
       
       // Przywróć poprzedni stan ręki, jeśli wystąpił błąd
       await loadRoomAndGameInfo(true);
@@ -616,6 +599,7 @@ function GameRoom({ roomId, onBack }) {
     
     try {
       setIsLoading(true);
+      setError(null);
       setShowColorModal(false);
       
       // Symuluj efekt zagrania karty - usuń ją z ręki natychmiast w UI
@@ -625,15 +609,19 @@ function GameRoom({ roomId, onBack }) {
         return updatedHand;
       });
       
-      // Wywołaj funkcję zagrania karty
-      await playCard(roomId, selectedCard, color, wallet);
+      // Wywołaj funkcję zagrania karty przez Socket.IO
+      const result = await playCard(roomId, selectedCard, color, wallet);
+      console.log("Play wild card result:", result);
+      
       setSelectedCard(null);
       
-      // Wymuszenie odświeżenia po zagraniu karty
-      await loadRoomAndGameInfo(true);
+      // Odśwież stan gry, jeśli to konieczne
+      if (result.winner || result.error) {
+        await loadRoomAndGameInfo(true);
+      }
     } catch (error) {
       console.error('Error playing wild card:', error);
-      alert('Błąd podczas zagrywania karty: ' + error.message);
+      setError(`Błąd podczas zagrywania karty: ${error.message}`);
       
       // Przywróć poprzedni stan ręki, jeśli wystąpił błąd
       await loadRoomAndGameInfo(true);
@@ -646,7 +634,8 @@ function GameRoom({ roomId, onBack }) {
   const handleDrawCard = async () => {
     if (
       gameStatus !== 'playing' ||
-      currentPlayerIndex !== playerIndex
+      currentPlayerIndex !== playerIndex ||
+      connectionStatus !== 'connected'
     ) {
       // Nie twoja kolej lub gra nie jest aktywna
       return;
@@ -654,20 +643,22 @@ function GameRoom({ roomId, onBack }) {
 
     try {
       setIsLoading(true);
+      setError(null);
       
-      // Wywołaj funkcję dobrania karty
+      // Wywołaj funkcję dobrania karty przez Socket.IO
       const drawnCard = await drawCard(roomId, wallet);
+      console.log("Drawn card:", drawnCard);
       
       // Symuluj efekt dobrania karty - dodaj ją do ręki natychmiast w UI
       if (drawnCard) {
         setPlayerHand(prev => [...prev, drawnCard]);
       }
       
-      // Wymuszenie odświeżenia po dobraniu karty
+      // Odśwież stan gry
       await loadRoomAndGameInfo(true);
     } catch (error) {
       console.error('Error drawing card:', error);
-      alert('Błąd podczas dobierania karty: ' + error.message);
+      setError(`Błąd podczas dobierania karty: ${error.message}`);
       
       // Przywróć poprzedni stan ręki, jeśli wystąpił błąd
       await loadRoomAndGameInfo(true);
@@ -678,19 +669,20 @@ function GameRoom({ roomId, onBack }) {
 
   // Odebranie nagrody
   const handleClaimPrize = async () => {
-    if (gameStatus !== 'ended' || winner !== publicKey.toString()) {
+    if (gameStatus !== 'ended' || winner !== publicKey?.toString()) {
       // Tylko zwycięzca może odebrać nagrodę po zakończeniu gry
       return;
     }
 
     try {
       setIsLoading(true);
+      setError(null);
       const result = await claimPrize(roomId, wallet);
       alert(`Gratulacje! Nagroda w wysokości ${result.prize} SOL została przesłana do Twojego portfela.`);
       onBack(); // Wróć do listy pokojów po odebraniu nagrody
     } catch (error) {
       console.error('Error claiming prize:', error);
-      alert('Błąd podczas odbierania nagrody: ' + error.message);
+      setError(`Błąd podczas odbierania nagrody: ${error.message}`);
     } finally {
       setIsLoading(false);
     }
@@ -705,11 +697,12 @@ function GameRoom({ roomId, onBack }) {
       if (confirmLeave) {
         try {
           setIsLoading(true);
+          setError(null);
           await leaveGame(roomId, wallet);
           onBack();
         } catch (error) {
           console.error("Error leaving game:", error);
-          alert("Wystąpił błąd podczas opuszczania gry: " + error.message);
+          setError(`Wystąpił błąd podczas opuszczania gry: ${error.message}`);
         } finally {
           setIsLoading(false);
         }
@@ -747,6 +740,7 @@ function GameRoom({ roomId, onBack }) {
       currentPlayerIndex === playerIndex && 
       isPlayerHand &&
       currentCard && // Dodaj sprawdzenie, czy currentCard istnieje
+      connectionStatus === 'connected' &&
       (card.color === currentCard.color || card.value === currentCard.value || card.color === 'black');
     
     const cardClasses = `uno-card ${card.color} ${isPlayable ? '' : 'disabled'}`;
@@ -830,22 +824,45 @@ function GameRoom({ roomId, onBack }) {
     );
   };
 
-  // Dodaj debugowanie dla stanu aplikacji
-  useEffect(() => {
-    console.log("GameRoom state updated:", {
-      roomId,
-      gameStatus,
-      playerIndex,
-      currentPlayerIndex,
-      isLoading,
-      hasRoomInfo: !!roomInfo,
-      playerHandSize: playerHand?.length || 0,
-      hasCurrentCard: !!currentCard,
-      opponentsCount: Object.keys(opponentsCards).length,
-      turnTimer,
-      timestamp: new Date().toISOString()
-    });
-  }, [roomId, gameStatus, playerIndex, currentPlayerIndex, isLoading, roomInfo, playerHand, currentCard, opponentsCards, turnTimer]);
+  // Wyświetlanie statusu połączenia
+  const renderConnectionStatus = () => {
+    if (gameStatus !== 'playing') return null;
+    
+    switch (connectionStatus) {
+      case 'connected':
+        return <div className="connection-status connected">Połączono z serwerem gry</div>;
+      case 'connecting':
+        return <div className="connection-status connecting">Łączenie z serwerem gry...</div>;
+      case 'disconnected':
+        return (
+          <div className="connection-status disconnected">
+            Brak połączenia z serwerem
+            <button 
+              className="reconnect-btn"
+              onClick={() => {
+                if (publicKey && roomInfo?.gameId) {
+                  setConnectionStatus('connecting');
+                  connectToGameServer(roomId, roomInfo.gameId, publicKey.toString())
+                    .then(() => {
+                      setConnectionStatus('connected');
+                      loadRoomAndGameInfo(true);
+                    })
+                    .catch(error => {
+                      console.error("Error reconnecting:", error);
+                      setConnectionStatus('disconnected');
+                      setError("Błąd połączenia z serwerem gry");
+                    });
+                }
+              }}
+            >
+              Połącz ponownie
+            </button>
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
 
   if (isLoading && !roomInfo) {
     return <div className="loading">Ładowanie pokoju...</div>;
@@ -862,12 +879,25 @@ function GameRoom({ roomId, onBack }) {
         </div>
       )}
       
+      {/* Wyświetlanie błędów */}
+      {error && (
+        <div className="error-message">
+          <p>{error}</p>
+          <button onClick={() => loadRoomAndGameInfo(true)}>Spróbuj ponownie</button>
+        </div>
+      )}
+      
+      {/* Status połączenia */}
+      {renderConnectionStatus()}
+      
       {/* Ekran dołączania do pokoju */}
       {gameStatus === 'joining' && (
         <div className="joining-section">
           <p>Wpisowe: {roomInfo?.entryFee} SOL</p>
           <p>Liczba graczy: {roomInfo?.currentPlayers}/{roomInfo?.maxPlayers}</p>
-          <button onClick={handleJoinRoom}>Zapłać wpisowe i dołącz</button>
+          <button onClick={handleJoinRoom} disabled={isLoading}>
+            {isLoading ? 'Dołączanie...' : 'Zapłać wpisowe i dołącz'}
+          </button>
           <button onClick={onBack}>Wróć</button>
         </div>
       )}
@@ -879,7 +909,20 @@ function GameRoom({ roomId, onBack }) {
           <p>Liczba graczy: {roomInfo ? `${roomInfo.currentPlayers}/${roomInfo.maxPlayers}` : 'Ładowanie...'}</p>
           <p>Twój indeks: {playerIndex !== -1 ? playerIndex + 1 : 'Nie jesteś w tym pokoju'}</p>
           <p>ID pokoju: {roomId}</p>
-          <button onClick={() => loadRoomAndGameInfo(true)}>Odśwież</button>
+          
+          {roomInfo && roomInfo.players.length >= 2 && playerIndex === 0 && (
+            <button 
+              onClick={handleStartGame} 
+              className="start-game-btn"
+              disabled={isLoading}
+            >
+              {isLoading ? 'Rozpoczynanie...' : 'Rozpocznij grę'}
+            </button>
+          )}
+          
+          <button onClick={() => loadRoomAndGameInfo(true)} disabled={isRefreshing}>
+            {isRefreshing ? 'Odświeżanie...' : 'Odśwież'}
+          </button>
           <button onClick={handleBackButton}>Wróć</button>
         </div>
       )}
@@ -959,8 +1002,12 @@ function GameRoom({ roomId, onBack }) {
             {/* Talia */}
             <div 
               className="deck" 
-              onClick={currentPlayerIndex === playerIndex && gameStatus === 'playing' ? handleDrawCard : undefined}
-              style={{ cursor: currentPlayerIndex === playerIndex && gameStatus === 'playing' ? 'pointer' : 'default' }}
+              onClick={currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' ? handleDrawCard : undefined}
+              style={{ 
+                cursor: currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' 
+                  ? 'pointer' 
+                  : 'default' 
+              }}
             >
               <div className="deck-cards">
                 <div className="deck-count">{deckSize}</div>
@@ -1006,14 +1053,23 @@ function GameRoom({ roomId, onBack }) {
           
           {/* Przyciski */}
           <div className="game-controls">
-            <button className="refresh-btn" onClick={() => loadRoomAndGameInfo(true)}>
-              Odśwież stan gry
+            <button 
+              className="refresh-btn" 
+              onClick={() => loadRoomAndGameInfo(true)} 
+              disabled={isRefreshing}
+            >
+              {isRefreshing ? 'Odświeżanie...' : 'Odśwież stan gry'}
             </button>
             
             {gameStatus === 'playing' &&
-              currentPlayerIndex === playerIndex && (
-                <button className="draw-card-btn" onClick={handleDrawCard}>
-                  Dobierz kartę
+              currentPlayerIndex === playerIndex && 
+              connectionStatus === 'connected' && (
+                <button 
+                  className="draw-card-btn" 
+                  onClick={handleDrawCard}
+                  disabled={isLoading}
+                >
+                  {isLoading ? 'Dobieranie...' : 'Dobierz kartę'}
                 </button>
               )}
               
@@ -1022,14 +1078,19 @@ function GameRoom({ roomId, onBack }) {
                 <button
                   className="claim-prize-btn"
                   onClick={handleClaimPrize}
+                  disabled={isLoading}
                 >
-                  Odbierz nagrodę ({roomInfo?.entryFee * roomInfo?.currentPlayers} SOL)
+                  {isLoading ? 'Odbieranie...' : `Odbierz nagrodę (${roomInfo?.entryFee * roomInfo?.currentPlayers} SOL)`}
                 </button>
               )}
           </div>
           
-          <button className="back-btn" onClick={handleBackButton}>
-            {gameStatus === 'ended' ? 'Wróć do listy pokojów' : 'Opuść grę'}
+          <button 
+            className="back-btn" 
+            onClick={handleBackButton}
+            disabled={isLoading}
+          >
+            {isLoading ? 'Wychodzenie...' : gameStatus === 'ended' ? 'Wróć do listy pokojów' : 'Opuść grę'}
           </button>
         </div>
       )}
