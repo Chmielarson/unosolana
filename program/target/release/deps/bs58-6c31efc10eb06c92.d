@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/libbs58-6c31efc10eb06c92.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/libbs58-6c31efc10eb06c92.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/bs58-6c31efc10eb06c92.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs:

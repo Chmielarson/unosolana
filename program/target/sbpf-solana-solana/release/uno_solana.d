@@ -1,0 +1,1 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/uno_solana.so: /Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/src/lib.rs /Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/src/uno_program.rs
