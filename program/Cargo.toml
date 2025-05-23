@@ -2,45 +2,20 @@
 name = "uno-solana"
 version = "0.1.0"
 edition = "2021"
-description = "Program Solana dla gry UNO"
-authors = ["Your Name <your.email@example.com>"]
-license = "MIT"
-
-[features]
-no-entrypoint = []
-custom-heap = []
-custom-panic = []
 
 [dependencies]
-solana-program = "=1.14.6"
-borsh = "=0.9.3"
-thiserror = "=1.0.37"
-spl-token = { version = "=3.5.0", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "=1.1.1", features = ["no-entrypoint"] }
+solana-program = "1.14.6"
+borsh = "0.9.3"
+thiserror = "1.0"
 
 [dev-dependencies]
-solana-program-test = "=1.14.6"
-solana-sdk = "=1.14.6"
+solana-program-test = "1.14.6"
+solana-sdk = "1.14.6"
 
 [lib]
 crate-type = ["cdylib", "lib"]
 
-[profile.release]
-opt-level = "z"          # Maksymalna optymalizacja rozmiaru
-overflow-checks = false  # Wyłącz sprawdzanie przepełnień
-lto = "fat"             # Link Time Optimization
-debug = false
-debug-assertions = false
-codegen-units = 1
-panic = "abort"
-incremental = false
-rpath = false
-strip = true            # Usuń symbole debugowania
+[features]
+no-entrypoint = []
 
-[profile.release.build-override]
-opt-level = "z"
-
-# Optymalizacje dla Solana BPF
-[profile.release.package."*"]
-opt-level = "z"
-overflow-checks = false
+# Usuń całą sekcję [profile.release] - pozwól Solana CLI zarządzać optymalizacjami

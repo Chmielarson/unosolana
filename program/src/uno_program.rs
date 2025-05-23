@@ -9,7 +9,8 @@ use solana_program::{
     pubkey::Pubkey,
     program::{invoke, invoke_signed},
     system_instruction,
-    sysvar::{rent::Rent, Sysvar},
+    sysvar::{rent::Rent, Sysvar, clock::Clock},
+    clock::UnixTimestamp,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -24,17 +25,17 @@ pub enum GameStatus {
 /// Struktura danych pokoju (gry) - zoptymalizowana dla modelu hybrydowego
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct GameRoom {
-    pub creator: Pubkey,                  // Twórca pokoju
-    pub max_players: u8,                  // Maksymalna liczba graczy
-    pub entry_fee_lamports: u64,          // Wpisowe w lamportach
-    pub players: Vec<Pubkey>,             // Lista graczy
-    pub status: GameStatus,               // Status gry
-    pub winner: Option<Pubkey>,           // Zwycięzca (jeśli jest)
-    pub created_at: i64,                  // Timestamp utworzenia pokoju
-    pub game_started_at: Option<i64>,     // Timestamp rozpoczęcia gry
-    pub game_ended_at: Option<i64>,       // Timestamp zakończenia gry
-    pub prize_claimed: bool,              // Czy nagroda została odebrana
-    pub game_id: String,                  // Identyfikator gry dla serwera off-chain
+    pub creator: Pubkey,                  // 32 bajty
+    pub max_players: u8,                  // 1 bajt
+    pub entry_fee_lamports: u64,          // 8 bajtów
+    pub players: Vec<Pubkey>,             // 4 + (32 * max 4) = 132 bajty
+    pub status: GameStatus,               // 1 bajt (enum)
+    pub winner: Option<Pubkey>,           // 1 + 32 = 33 bajty
+    pub created_at: i64,                  // 8 bajtów
+    pub game_started_at: Option<i64>,     // 1 + 8 = 9 bajtów
+    pub game_ended_at: Option<i64>,       // 1 + 8 = 9 bajtów
+    pub prize_claimed: bool,              // 1 bajt
+    pub game_id: [u8; 64],               // 64 bajty - stały rozmiar zamiast String
 }
 
 impl GameRoom {
@@ -50,8 +51,21 @@ impl GameRoom {
             game_started_at: None,
             game_ended_at: None,
             prize_claimed: false,
-            game_id: String::new(),
+            game_id: [0u8; 64], // Inicjalizacja pustą tablicą
         }
+    }
+    
+    // Dodajemy metodę pomocniczą do ustawiania game_id
+    pub fn set_game_id(&mut self, id: &str) {
+        let bytes = id.as_bytes();
+        let len = bytes.len().min(64);
+        self.game_id[..len].copy_from_slice(&bytes[..len]);
+    }
+    
+    // Dodajemy metodę do odczytu game_id
+    pub fn get_game_id(&self) -> String {
+        let end = self.game_id.iter().position(|&b| b == 0).unwrap_or(64);
+        String::from_utf8_lossy(&self.game_id[..end]).to_string()
     }
 }
 
@@ -209,7 +223,7 @@ fn process_create_room(
     
     // Obliczenie czynszu
     let rent = Rent::from_account_info(rent_account)?;
-    let space = 1000; // Orientacyjny rozmiar danych pokoju
+    let space = 512; // Zwiększony rozmiar dla bezpieczeństwa
     let lamports = rent.minimum_balance(space);
     
     // Utworzenie konta PDA
@@ -244,10 +258,9 @@ fn process_create_room(
     )?;
     
     // Inicjalizacja danych pokoju
-    let current_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    // Użyj Clock sysvar zamiast std::time
+    let clock = Clock::get()?;
+    let current_timestamp = clock.unix_timestamp;
     
     let game_room = GameRoom::new(
         *creator_account.key,
@@ -265,7 +278,7 @@ fn process_create_room(
 
 /// Implementacja dołączania do pokoju
 fn process_join_room(
-    _program_id: &Pubkey,  // Dodaj podkreślenie
+    _program_id: &Pubkey,  // Dodano podkreślenie
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
@@ -279,8 +292,17 @@ fn process_join_room(
         return Err(ProgramError::MissingRequiredSignature);
     }
     
+    // Sprawdzenie rozmiaru konta przed deserializacją
+    msg!("Game account data length: {}", game_account.data_len());
+    
     // Wczytanie danych pokoju
-    let mut game_room = GameRoom::try_from_slice(&game_account.data.borrow())?;
+    let mut game_room = match GameRoom::try_from_slice(&game_account.data.borrow()) {
+        Ok(room) => room,
+        Err(e) => {
+            msg!("Failed to deserialize game room: {:?}", e);
+            return Err(ProgramError::InvalidAccountData);
+        }
+    };
     
     // Sprawdzenie stanu pokoju
     if game_room.status != GameStatus::WaitingForPlayers {
@@ -357,20 +379,16 @@ fn process_start_game(
     
     // Ustawienie statusu gry i zapisanie ID gry off-chain
     game_room.status = GameStatus::InProgress;
-    game_room.game_id = game_id.clone();
+    game_room.set_game_id(&game_id);
     
     // Zapisanie czasu rozpoczęcia
-    let current_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    
-    game_room.game_started_at = Some(current_timestamp);
+    let clock = Clock::get()?;
+    game_room.game_started_at = Some(clock.unix_timestamp);
     
     // Zapisanie zaktualizowanych danych
     game_room.serialize(&mut *game_account.data.borrow_mut())?;
     
-    msg!("Gra UNO rozpoczęta. Off-chain ID: {}", game_id);
+    msg!("Gra UNO rozpoczęta. Off-chain ID: {}", game_room.get_game_id());
     Ok(())
 }
 
@@ -416,12 +434,8 @@ fn process_end_game(
     game_room.winner = Some(winner);
     
     // Zapisanie czasu zakończenia
-    let current_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    
-    game_room.game_ended_at = Some(current_timestamp);
+    let clock = Clock::get()?;
+    game_room.game_ended_at = Some(clock.unix_timestamp);
     
     // Zapisanie zaktualizowanych danych
     game_room.serialize(&mut *game_account.data.borrow_mut())?;
@@ -498,7 +512,7 @@ fn process_claim_prize(
 
 /// Implementacja anulowania pokoju
 fn process_cancel_room(
-    _program_id: &Pubkey,  // Dodaj podkreślenie
+    program_id: &Pubkey,  // Poprawiono - usunięto podkreślenie (parametr jest używany)
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();

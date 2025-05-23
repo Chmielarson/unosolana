@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libmemoffset-5257a71bf0c8932f.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/raw_field.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/offset_of.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/span_of.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libmemoffset-5257a71bf0c8932f.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/raw_field.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/offset_of.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/span_of.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/memoffset-5257a71bf0c8932f.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/raw_field.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/offset_of.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/span_of.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/raw_field.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/offset_of.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/memoffset-0.9.1/src/span_of.rs:

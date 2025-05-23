@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libthiserror-1f8523cd9b98875c.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/aserror.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/display.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/provide.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libthiserror-1f8523cd9b98875c.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/aserror.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/display.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/provide.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/thiserror-1f8523cd9b98875c.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/aserror.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/display.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/provide.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/aserror.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/display.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-1.0.69/src/provide.rs:

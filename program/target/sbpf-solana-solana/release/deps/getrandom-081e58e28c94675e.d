@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libgetrandom-081e58e28c94675e.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/error.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/util.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/custom.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libgetrandom-081e58e28c94675e.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/error.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/util.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/custom.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/getrandom-081e58e28c94675e.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/error.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/util.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/custom.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/error.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/util.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/getrandom-0.2.16/src/custom.rs:
