@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libbs58-ac0c97552179d1b8.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/libbs58-ac0c97552179d1b8.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/sbpf-solana-solana/release/deps/bs58-ac0c97552179d1b8.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/alphabet.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/decode.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/bs58-0.4.0/src/encode.rs:

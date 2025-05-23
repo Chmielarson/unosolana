@@ -1,0 +1,10 @@
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/libversion_check-867ecaf0f80b70f1.rmeta: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/version.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/channel.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/date.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/libversion_check-867ecaf0f80b70f1.rlib: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/version.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/channel.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/date.rs
+
+/Users/mateuszchmielarek/Downloads/UNO/uno-solana/program/target/release/deps/version_check-867ecaf0f80b70f1.d: /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/lib.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/version.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/channel.rs /Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/date.rs
+
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/lib.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/version.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/channel.rs:
+/Users/mateuszchmielarek/.cargo/registry/src/index.crates.io-6f17d22bba15001f/version_check-0.9.5/src/date.rs:

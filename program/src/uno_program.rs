@@ -265,7 +265,7 @@ fn process_create_room(
 
 /// Implementacja dołączania do pokoju
 fn process_join_room(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,  // Dodaj podkreślenie
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
@@ -498,7 +498,7 @@ fn process_claim_prize(
 
 /// Implementacja anulowania pokoju
 fn process_cancel_room(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,  // Dodaj podkreślenie
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
