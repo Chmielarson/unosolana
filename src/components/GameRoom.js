@@ -53,6 +53,7 @@ function GameRoom({ roomId, onBack }) {
   const [isGameInitialized, setIsGameInitialized] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('disconnected'); // disconnected, connecting, connected
   const [error, setError] = useState(null);
+  const [unsubscribeGameState, setUnsubscribeGameState] = useState(null);
 
   // Funkcja łącząca ładowanie informacji o pokoju i stanie gry z deduplikacją
   const loadRoomAndGameInfo = useCallback(async (force = false) => {
@@ -212,8 +213,13 @@ function GameRoom({ roomId, onBack }) {
     console.log("Setting up game state listeners for room:", roomId);
     const playerAddr = publicKey.toString();
     
+    // Czyszczenie poprzedniego nasłuchiwania
+    if (unsubscribeGameState) {
+      unsubscribeGameState();
+    }
+    
     // Nasłuchiwanie zmian stanu gry za pomocą Socket.IO
-    const unsubGameState = listenForGameState(roomId, playerAddr, (updatedGameState) => {
+    const unsubscribe = listenForGameState(roomId, playerAddr, (updatedGameState) => {
       console.log("Game state updated via socket:", updatedGameState);
       
       // Ważne: ustaw timestamp ostatniej aktualizacji
@@ -223,10 +229,12 @@ function GameRoom({ roomId, onBack }) {
       updateGameState(updatedGameState);
     });
     
+    // Zapisz funkcję anulującą nasłuchiwanie
+    setUnsubscribeGameState(() => unsubscribe);
+    
     // Funkcja czyszcząca nasłuchiwacze
     return () => {
-      console.log("Cleaning up game state listeners");
-      if (unsubGameState) unsubGameState();
+      if (unsubscribe) unsubscribe();
     };
   }, [roomId, publicKey, isLoading, isGameInitialized, connectionStatus]);
 
@@ -699,6 +707,12 @@ function GameRoom({ roomId, onBack }) {
           setIsLoading(true);
           setError(null);
           await leaveGame(roomId, wallet);
+          
+          // Czyszczenie zasobów przed opuszczeniem
+          if (unsubscribeGameState) {
+            unsubscribeGameState();
+          }
+          
           onBack();
         } catch (error) {
           console.error("Error leaving game:", error);
@@ -713,9 +727,25 @@ function GameRoom({ roomId, onBack }) {
       }
     }
     
-    // W innych przypadkach po prostu wróć
+    // W innych przypadkach po prostu wróć, ale upewnij się, że zasoby zostaną zwolnione
+    if (unsubscribeGameState) {
+      unsubscribeGameState();
+    }
+    
     onBack();
   };
+
+  // Czyszczenie zasobów przy odmontowaniu komponentu
+  useEffect(() => {
+    return () => {
+      // Anuluj wszystkie subskrypcje
+      if (unsubscribeGameState) {
+        unsubscribeGameState();
+      }
+      
+      console.log("GameRoom component unmounting, cleaning up resources");
+    };
+  }, []);
 
   // Renderowanie karty UNO
   const renderUnoCard = (card, index, isPlayerHand = false) => {

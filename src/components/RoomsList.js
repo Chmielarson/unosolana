@@ -1,6 +1,6 @@
 // src/components/RoomsList.js
 import React, { useState, useEffect } from 'react';
-import { getRooms } from '../utils/SolanaTransactions';
+import { getRooms, getRoomsUpdates } from '../utils/SolanaTransactions';
 
 function RoomsList({ onJoinRoom }) {
   const [rooms, setRooms] = useState([]);
@@ -25,16 +25,17 @@ function RoomsList({ onJoinRoom }) {
 
     fetchRooms();
     
-    // Ustaw interwał odświeżania zamiast nasłuchiwania Firebase
-    const interval = setInterval(() => {
-      fetchRooms().catch(error => {
-        console.error('Error refreshing rooms:', error);
-      });
-    }, 10000); // Odświeżaj co 10 sekund
+    // Ustaw nasłuchiwanie aktualizacji pokojów
+    const unsubscribe = getRoomsUpdates((updatedRooms) => {
+      console.log("Rooms update received:", updatedRooms.length);
+      setRooms(updatedRooms);
+    });
     
-    // Sprzątanie - anulowanie interwału przy odmontowaniu komponentu
+    // Sprzątanie - anulowanie subskrypcji przy odmontowaniu komponentu
     return () => {
-      clearInterval(interval);
+      if (unsubscribe) {
+        unsubscribe();
+      }
     };
   }, []);
 
@@ -82,7 +83,7 @@ function RoomsList({ onJoinRoom }) {
                   <p>Utworzony przez: {room.creatorAddress.substring(0, 4)}...{room.creatorAddress.substring(room.creatorAddress.length - 4)}</p>
                   <p>Gracze: {room.currentPlayers}/{room.maxPlayers}</p>
                   <p>Wpisowe: {room.entryFee} SOL</p>
-                  <p>Pula: {room.pool} SOL</p>
+                  <p>Pula: {room.entryFee * room.currentPlayers} SOL</p>
                   <p>Status: {room.gameStarted ? 'Gra w toku' : 'Oczekiwanie'}</p>
                   {room.lastActivity && (
                     <p className="last-activity">

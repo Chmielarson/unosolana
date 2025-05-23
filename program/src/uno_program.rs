@@ -117,10 +117,23 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     input: &[u8],
 ) -> ProgramResult {
+    msg!("Program called with {} bytes of data", input.len());
+    msg!("Data: {:?}", input);
+    
+    // Sprawdź, czy mamy wystarczająco danych
+    if input.is_empty() {
+        msg!("Error: No instruction data provided");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    
+    // Sprawdź pierwszy bajt (instruction tag)
+    msg!("Instruction tag: {}", input[0]);
+    
     let instruction = UnoInstruction::try_from_slice(input)?;
     
     match instruction {
         UnoInstruction::CreateRoom { max_players, entry_fee_lamports } => {
+            msg!("Processing CreateRoom: max_players={}, entry_fee={}", max_players, entry_fee_lamports);
             process_create_room(program_id, accounts, max_players, entry_fee_lamports)
         },
         UnoInstruction::JoinRoom => {
@@ -148,12 +161,27 @@ fn process_create_room(
     max_players: u8,
     entry_fee_lamports: u64,
 ) -> ProgramResult {
+    msg!("Starting create_room with max_players: {}, entry_fee: {}", max_players, entry_fee_lamports);
+    
     let accounts_iter = &mut accounts.iter();
     
     let creator_account = next_account_info(accounts_iter)?;
+    msg!("Creator account: {}", creator_account.key);
+    
     let game_account = next_account_info(accounts_iter)?;
+    msg!("Game account: {}", game_account.key);
+    
     let system_program = next_account_info(accounts_iter)?;
+    msg!("System program: {}", system_program.key);
+    
     let rent_account = next_account_info(accounts_iter)?;
+    msg!("Rent account: {}", rent_account.key);
+    
+    // Sprawdź, czy to rzeczywiście system program
+    if *system_program.key != solana_program::system_program::ID {
+        msg!("Error: Invalid system program account");
+        return Err(ProgramError::InvalidArgument);
+    }
     
     // Weryfikacja podpisu
     if !creator_account.is_signer {

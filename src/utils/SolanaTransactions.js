@@ -12,20 +12,52 @@ import io from 'socket.io-client';
 import { Buffer } from 'buffer';
 
 // Połączenie z siecią Solana
-const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
+const NETWORK = process.env.REACT_APP_SOLANA_NETWORK || 'devnet';
+const connection = new Connection(clusterApiUrl(NETWORK), 'confirmed');
 
-// Adres serwera gry
+// Adres serwera gry - domyślnie localhost dla developmentu
 const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://localhost:3001';
 
 // Adres programu Solana (smart contract)
-const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || '3PtVXcKqQTQpUyCn5RCsrKL9nnHsAD6Kinf81LeBr1Vs');
+const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'fugHC2jFBQSBmUfo4qZesJTBHXoaRMUpCYSkUppWtP9');
 
-// Instancja Socket.IO
+// Stałe dla Solana
+const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
+
+// Socket.IO dla komunikacji w czasie rzeczywistym
 let socket = null;
+let socketConnected = false;
+let roomSubscriptions = new Map(); // Mapa subskrypcji pokojów
+let gameStateSubscriptions = new Map(); // Mapa subskrypcji stanów gier
 
-// Serializacja danych Borsh dla instrukcji programu Solana
+// ========== SERIALIZACJA DANYCH BORSH DLA INSTRUKCJI PROGRAMU SOLANA ==========
+
+/*
+WAŻNE: Te funkcje serializacji muszą odpowiadać strukturom w programie Rust:
+
+pub enum UnoInstruction {
+    CreateRoom {        // Tag: 0
+        max_players: u8,        // 1 bajt na pozycji 1
+        entry_fee_lamports: u64, // 8 bajtów na pozycji 2-9 (little-endian)
+    },
+    JoinRoom,           // Tag: 1 (tylko tag)
+    StartGame {         // Tag: 2
+        game_id: String,        // u32 długość + UTF-8 bajty
+    },
+    EndGame {           // Tag: 3
+        winner: Pubkey,         // 32 bajty
+    },
+    ClaimPrize,         // Tag: 4 (tylko tag)
+    CancelRoom,         // Tag: 5 (tylko tag)
+}
+
+Porządek bajtów: little-endian dla liczb, UTF-8 dla stringów
+*/
+
+// Serializacja instrukcji CreateRoom
 function serializeCreateRoomData(maxPlayers, entryFee) {
-  const buffer = Buffer.alloc(1000);
+  // Tworzymy bufor odpowiedniej wielkości: 1 + 1 + 8 = 10 bajtów
+  const buffer = Buffer.alloc(10);
   
   // Instrukcja CreateRoom (0)
   buffer.writeUInt8(0, 0);
@@ -33,51 +65,87 @@ function serializeCreateRoomData(maxPlayers, entryFee) {
   // max_players: u8
   buffer.writeUInt8(maxPlayers, 1);
   
-  // entry_fee_lamports: u64
+  // entry_fee_lamports: u64 (zapisane jako little-endian)
   const entryFeeLamports = Math.round(entryFee * LAMPORTS_PER_SOL);
+  console.log("Entry fee:", entryFee, "SOL =", entryFeeLamports, "lamports");
+  
+  // Sprawdź, czy wartość mieści się w zakresie u64
+  if (entryFeeLamports < 0) {
+    throw new Error("Entry fee cannot be negative");
+  }
+  
+  // Używamy Buffer.writeBigUInt64LE na pozycji 2
   buffer.writeBigUInt64LE(BigInt(entryFeeLamports), 2);
   
-  return buffer.slice(0, 10);
-}
-
-function serializeJoinRoomData() {
-  const buffer = Buffer.alloc(1);
-  
-  // Instrukcja JoinRoom (1)
-  buffer.writeUInt8(1, 0);
+  console.log("Serialized CreateRoom data:", {
+    instruction: buffer[0],
+    maxPlayers: buffer[1], 
+    entryFeeLamports: entryFeeLamports,
+    bufferLength: buffer.length,
+    buffer: Array.from(buffer)
+  });
   
   return buffer;
 }
 
+// Serializacja instrukcji JoinRoom
+function serializeJoinRoomData() {
+  const buffer = Buffer.alloc(1);
+  
+  // Instrukcja JoinRoom (1)  
+  buffer.writeUInt8(1, 0);
+  
+  console.log("Serialized JoinRoom data:", Array.from(buffer));
+  return buffer;
+}
+
+// Serializacja instrukcji StartGame
 function serializeStartGameData(gameId) {
-  const buffer = Buffer.alloc(100);
+  // Oblicz długość potrzebną: 1 bajt instrukcji + 4 bajty długość stringa + długość stringa
+  const gameIdBytes = Buffer.from(gameId, 'utf8');
+  const buffer = Buffer.alloc(1 + 4 + gameIdBytes.length);
   
   // Instrukcja StartGame (2)
   buffer.writeUInt8(2, 0);
   
-  // Długość gameId
-  const gameIdBytes = Buffer.from(gameId, 'utf8');
-  buffer.writeUInt8(gameIdBytes.length, 1);
+  // Długość gameId jako u32 (little-endian)
+  buffer.writeUInt32LE(gameIdBytes.length, 1);
   
   // Zawartość gameId
-  gameIdBytes.copy(buffer, 2);
+  gameIdBytes.copy(buffer, 5);
   
-  return buffer.slice(0, 2 + gameIdBytes.length);
-}
-
-function serializeEndGameData(winnerPubkey) {
-  const buffer = Buffer.alloc(34);
-  
-  // Instrukcja EndGame (3)
-  buffer.writeUInt8(3, 0);
-  
-  // Winner Pubkey
-  const winnerPubkeyBuffer = winnerPubkey.toBuffer();
-  winnerPubkeyBuffer.copy(buffer, 1);
+  console.log("Serialized StartGame data:", {
+    instruction: buffer[0],
+    gameIdLength: buffer.readUInt32LE(1), 
+    gameId: gameId,
+    bufferLength: buffer.length,
+    buffer: Array.from(buffer)
+  });
   
   return buffer;
 }
 
+// Serializacja instrukcji EndGame
+function serializeEndGameData(winnerPubkey) {
+  const buffer = Buffer.alloc(1 + 32); // 1 bajt instrukcji + 32 bajty pubkey
+  
+  // Instrukcja EndGame (3)
+  buffer.writeUInt8(3, 0);
+  
+  // Winner Pubkey (32 bajty)
+  const winnerPubkeyBuffer = winnerPubkey.toBuffer();
+  winnerPubkeyBuffer.copy(buffer, 1);
+  
+  console.log("Serialized EndGame data:", {
+    instruction: buffer[0],
+    winner: winnerPubkey.toString(),
+    bufferLength: buffer.length
+  });
+  
+  return buffer;
+}
+
+// Serializacja instrukcji ClaimPrize
 function serializeClaimPrizeData() {
   const buffer = Buffer.alloc(1);
   
@@ -87,6 +155,7 @@ function serializeClaimPrizeData() {
   return buffer;
 }
 
+// Serializacja instrukcji CancelRoom
 function serializeCancelRoomData() {
   const buffer = Buffer.alloc(1);
   
@@ -96,6 +165,8 @@ function serializeCancelRoomData() {
   return buffer;
 }
 
+// ========== FUNKCJE POMOCNICZE ==========
+
 // Znajdź adres PDA dla pokoju gry
 async function findGamePDA(creatorPubkey) {
   return await PublicKey.findProgramAddress(
@@ -104,30 +175,198 @@ async function findGamePDA(creatorPubkey) {
   );
 }
 
-// Funkcja do pobrania listy pokojów
-export async function getRooms() {
-  console.log("Getting rooms list from server and blockchain");
-  try {
-    // Pobierz pokoje przez API serwera
-    const response = await fetch(`${GAME_SERVER_URL}/api/rooms`);
-    if (!response.ok) {
+// Inicjalizacja i zarządzanie Socket.IO
+function initializeSocket() {
+  if (socket) {
+    // Jeśli socket już istnieje, ale jest rozłączony, spróbuj ponownie połączyć
+    if (!socket.connected) {
+      socket.connect();
+    }
+    return socket;
+  }
+  
+  // Inicjalizuj nowy socket
+  socket = io(GAME_SERVER_URL, {
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    timeout: 10000,
+    autoConnect: true
+  });
+  
+  // Ustaw handlery zdarzeń
+  socket.on('connect', () => {
+    console.log('Connected to game server:', socket.id);
+    socketConnected = true;
+    
+    // Ponownie subskrybuj wszystkie pokoje i stany gier
+    recheckSubscriptions();
+  });
+  
+  socket.on('disconnect', (reason) => {
+    console.log('Disconnected from game server:', reason);
+    socketConnected = false;
+  });
+  
+  socket.on('error', (error) => {
+    console.error('Socket.IO error:', error);
+  });
+  
+  // Zwróć socket
+  return socket;
+}
+
+// Ponowna subskrypcja wszystkich pokojów i stanów gier
+function recheckSubscriptions() {
+  if (!socket || !socketConnected) return;
+  
+  // Ponowna subskrypcja pokojów
+  for (const [roomId, callback] of roomSubscriptions.entries()) {
+    console.log('Re-subscribing to room:', roomId);
+    socket.emit('subscribe_room', { roomId });
+  }
+  
+  // Ponowna subskrypcja stanów gier
+  for (const [data, callback] of gameStateSubscriptions.entries()) {
+    const { roomId, playerAddress } = JSON.parse(data);
+    console.log('Re-subscribing to game state:', { roomId, playerAddress });
+    socket.emit('join_game', { roomId, playerAddress });
+  }
+}
+
+// Funkcja do obsługi błędów HTTP
+async function handleApiResponse(response) {
+  if (!response.ok) {
+    // Próba odczytu szczegółów błędu
+    try {
+      const errorData = await response.json();
+      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+    } catch (e) {
+      // Jeśli nie udało się odczytać JSON, użyj ogólnego komunikatu
       throw new Error(`HTTP error! status: ${response.status}`);
     }
-    
-    const rooms = await response.json();
-    console.log("Rooms found:", rooms.length);
-    
-    return rooms;
+  }
+  
+  return await response.json();
+}
+
+// Retry z eksponencjalnym opóźnieniem dla wywołań API
+async function retryFetch(url, options, maxRetries = 3) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      const response = await fetch(url, options);
+      return await handleApiResponse(response);
+    } catch (error) {
+      retries++;
+      if (retries >= maxRetries) {
+        throw error;
+      }
+      
+      // Eksponencjalne opóźnienie przed ponowną próbą
+      const delay = Math.min(1000 * Math.pow(2, retries), 10000);
+      console.log(`Retry ${retries}/${maxRetries} after ${delay}ms for ${url}`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
+// ========== FUNKCJE API SERWERA GRY ==========
+
+// Funkcja do pobrania listy pokojów
+export async function getRooms() {
+  console.log("Getting rooms list from server");
+  try {
+    return await retryFetch(`${GAME_SERVER_URL}/api/rooms`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
   } catch (error) {
     console.error('Error getting rooms:', error);
-    return [];
+    throw error;
   }
+}
+
+// Funkcja do nasłuchiwania aktualizacji pokojów
+export function getRoomsUpdates(callback) {
+  console.log("Setting up rooms updates listener");
+  
+  // Inicjalizuj Socket.IO, jeśli nie jest zainicjalizowane
+  initializeSocket();
+  
+  // Usuń istniejącą subskrypcję, jeśli istnieje
+  if (socket) {
+    socket.off('rooms_update');
+  }
+  
+  // Nasłuchuj aktualizacji pokojów
+  socket.on('rooms_update', (rooms) => {
+    console.log('Received rooms update:', rooms.length);
+    callback(rooms);
+  });
+  
+  // Zażądaj początkowej listy pokojów
+  socket.emit('get_rooms');
+  
+  // Zwróć funkcję do anulowania nasłuchiwania
+  return () => {
+    if (socket) {
+      socket.off('rooms_update');
+    }
+  };
+}
+
+// Funkcja do nasłuchiwania zmian w pokoju
+export function listenForRoom(roomId, callback) {
+  console.log("Setting up room listener for:", roomId);
+  
+  // Inicjalizuj Socket.IO, jeśli nie jest zainicjalizowane
+  initializeSocket();
+  
+  // Zapisz callback w mapie subskrypcji
+  roomSubscriptions.set(roomId, callback);
+  
+  // Anuluj poprzednią subskrypcję
+  if (socket) {
+    socket.off(`room_update_${roomId}`);
+  }
+  
+  // Nasłuchuj aktualizacji pokoju
+  socket.on(`room_update_${roomId}`, (roomData) => {
+    console.log('Received room update:', roomId);
+    callback(roomData);
+  });
+  
+  // Zażądaj subskrypcji pokoju
+  socket.emit('subscribe_room', { roomId });
+  
+  // Zwróć funkcję do anulowania nasłuchiwania
+  return () => {
+    if (socket) {
+      socket.off(`room_update_${roomId}`);
+    }
+    roomSubscriptions.delete(roomId);
+  };
 }
 
 // Funkcja do tworzenia nowego pokoju
 export async function createRoom(maxPlayers, entryFee, wallet) {
-  console.log("Creating room with:", { maxPlayers, entryFee });
-  console.log("Wallet:", wallet);
+  console.log("Creating room with parameters:", { maxPlayers, entryFee });
+  
+  // Walidacja parametrów wejściowych
+  if (!maxPlayers || maxPlayers < 2 || maxPlayers > 4) {
+    throw new Error('Liczba graczy musi być między 2 a 4');
+  }
+  
+  if (!entryFee || entryFee <= 0) {
+    throw new Error('Wpisowe musi być większe od 0');
+  }
+  
+  if (entryFee > 10) {
+    throw new Error('Wpisowe nie może być większe niż 10 SOL');
+  }
   
   const { publicKey, signTransaction } = wallet;
   
@@ -135,10 +374,20 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
     throw new Error('Portfel nie jest połączony');
   }
 
+  console.log("Wallet info:", {
+    publicKey: publicKey.toString(),
+    hasSignTransaction: typeof signTransaction === 'function'
+  });
+
   try {
     // Znajdź adres PDA dla pokoju
     const [gamePDA, bump] = await findGamePDA(publicKey);
-    console.log("Game PDA:", gamePDA.toString());
+    console.log("Game PDA found:", {
+      address: gamePDA.toString(),
+      bump,
+      creator: publicKey.toString(),
+      programId: PROGRAM_ID.toString()
+    });
     
     // Serializuj dane instrukcji
     const data = serializeCreateRoomData(maxPlayers, entryFee);
@@ -149,10 +398,21 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
         { pubkey: publicKey, isSigner: true, isWritable: true },
         { pubkey: gamePDA, isSigner: false, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: PublicKey.default, isSigner: false, isWritable: false }, // Rent sysvar
+        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
       ],
       programId: PROGRAM_ID,
       data: data
+    });
+    
+    console.log("Instruction created:", {
+      keys: instruction.keys.map(k => ({
+        pubkey: k.pubkey.toString(),
+        isSigner: k.isSigner,
+        isWritable: k.isWritable
+      })),
+      programId: instruction.programId.toString(),
+      dataLength: instruction.data.length,
+      data: Array.from(instruction.data)
     });
     
     // Utwórz transakcję
@@ -163,58 +423,84 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = publicKey;
     
+    // Wyświetl szczegóły transakcji przed wysłaniem
+    console.log("Transaction details:", {
+      blockhash: transaction.recentBlockhash,
+      feePayer: transaction.feePayer?.toString(),
+      instructionsCount: transaction.instructions.length,
+      signatures: transaction.signatures.length
+    });
+    
     // Podpisz transakcję
     let signedTransaction;
     try {
       signedTransaction = await signTransaction(transaction);
+      console.log("Transaction signed successfully");
     } catch (signError) {
+      console.error("Error signing transaction:", signError);
       throw new Error(`Błąd podpisu: ${signError.message}`);
     }
     
     // Wyślij transakcję
-    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    console.log("Sending transaction...");
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+    
+    console.log("Transaction sent, signature:", signature);
     
     // Poczekaj na potwierdzenie
-    await connection.confirmTransaction({
+    console.log("Waiting for confirmation...");
+    const confirmation = await connection.confirmTransaction({
       blockhash,
       lastValidBlockHeight,
       signature
     }, 'confirmed');
     
+    if (confirmation.value.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+    
     console.log("Room creation transaction confirmed:", signature);
     
     // Zarejestruj pokój na serwerze
-    const serverRegistration = await fetch(`${GAME_SERVER_URL}/api/rooms`, {
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         creatorAddress: publicKey.toString(),
         maxPlayers,
         entryFee,
-        roomAddress: gamePDA.toString()
+        roomAddress: gamePDA.toString(),
+        transactionSignature: signature
       }),
     });
     
-    if (!serverRegistration.ok) {
-      throw new Error(`Server error: ${serverRegistration.status}`);
-    }
-    
-    const roomData = await serverRegistration.json();
     console.log("Room registered on server:", roomData);
     
     return roomData.roomId;
   } catch (error) {
     console.error('Error creating room:', error);
+    
+    // Jeśli to błąd SendTransaction, spróbuj uzyskać dodatkowe informacje
+    if (error.name === 'SendTransactionError') {
+      try {
+        const logs = await error.getLogs();
+        console.error('Transaction logs:', logs);
+      } catch (logError) {
+        console.error('Could not get transaction logs:', logError);
+      }
+    }
+    
     throw error;
   }
 }
 
+// Funkcja do dołączania do pokoju
 export async function joinRoom(roomId, entryFee, wallet) {
-  console.log("Join room function called:", { roomId, entryFee });
+  console.log("Joining room:", { roomId, entryFee });
   
-  // Zabezpieczenie przed nieprawidłowymi danymi wejściowymi
   if (!roomId) {
     throw new Error('Brak identyfikatora pokoju');
   }
@@ -223,24 +509,19 @@ export async function joinRoom(roomId, entryFee, wallet) {
     throw new Error('Nieprawidłowa kwota wpisowego');
   }
   
-  if (!wallet || !wallet.publicKey) {
-    throw new Error('Portfel nie jest połączony');
-  }
-  
   const { publicKey, signTransaction } = wallet;
   
-  if (!signTransaction) {
-    throw new Error('Portfel nie ma funkcji podpisywania transakcji');
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
   }
 
   try {
     // 1. Pobierz dane pokoju z serwera
-    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!roomResponse.ok) {
-      throw new Error(`Server error: ${roomResponse.status}`);
-    }
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
     
-    const roomData = await roomResponse.json();
     console.log("Room data from server:", roomData);
     
     // 2. Pobierz adres PDA pokoju
@@ -277,77 +558,88 @@ export async function joinRoom(roomId, entryFee, wallet) {
     }
     
     // 8. Wyślij transakcję
-    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    console.log("Sending join room transaction...");
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+    
+    console.log("Join room transaction sent, signature:", signature);
     
     // 9. Poczekaj na potwierdzenie
-    await connection.confirmTransaction({
+    console.log("Waiting for confirmation...");
+    const confirmation = await connection.confirmTransaction({
       blockhash,
       lastValidBlockHeight,
       signature
     }, 'confirmed');
     
+    if (confirmation.value.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+    
     console.log("Join room transaction confirmed:", signature);
     
     // 10. Powiadom serwer o dołączeniu gracza
-    const joinResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/join`, {
+    const joinResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/join`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        playerAddress: publicKey.toString()
+        playerAddress: publicKey.toString(),
+        transactionSignature: signature
       }),
     });
     
-    if (!joinResponse.ok) {
-      throw new Error(`Server error: ${joinResponse.status}`);
-    }
-    
-    console.log("Join room completed successfully");
-    return true;
+    console.log("Join room completed successfully:", joinResult);
+    return joinResult;
   } catch (error) {
     console.error('Error joining room:', error);
+    
+    // Jeśli to błąd SendTransaction, spróbuj uzyskać dodatkowe informacje
+    if (error.name === 'SendTransactionError') {
+      try {
+        const logs = await error.getLogs();
+        console.error('Transaction logs:', logs);
+      } catch (logError) {
+        console.error('Could not get transaction logs:', logError);
+      }
+    }
+    
     throw error;
   }
 }
 
 // Funkcja do opuszczania gry
 export async function leaveGame(roomId, wallet) {
-  console.log("Player is leaving game:", roomId);
+  console.log("Leaving game:", roomId);
+  
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
   try {
-    const { publicKey } = wallet;
-    
-    if (!publicKey) {
-      throw new Error('Portfel nie jest połączony');
-    }
-    
     // Powiadom serwer o opuszczeniu pokoju
-    const leaveResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/leave`, {
+    const leaveResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/leave`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         playerAddress: publicKey.toString()
       }),
     });
     
-    if (!leaveResponse.ok) {
-      throw new Error(`Server error: ${leaveResponse.status}`);
-    }
-    
-    const result = await leaveResponse.json();
-    
     // Jeśli gra była w toku i jest inny gracz, zakończ grę na łańcuchu
-    if (result.wasActive && result.opponentWins) {
-      await endGame(roomId, result.opponentAddress, wallet);
+    if (leaveResult.wasActive && leaveResult.opponentWins) {
+      await endGame(roomId, leaveResult.opponentAddress, wallet);
     }
     
-    if (socket) {
-      socket.disconnect();
+    // Rozłącz socket.io, jeśli istnieje
+    if (socket && socket.connected) {
+      socket.emit('leave_game', { roomId, playerAddress: publicKey.toString() });
     }
     
-    return { success: true, message: 'Opuszczono pokój' };
+    return leaveResult;
   } catch (error) {
     console.error('Error leaving game:', error);
     throw error;
@@ -359,12 +651,11 @@ export async function getRoomInfo(roomId) {
   console.log("Getting room info for room:", roomId);
   
   try {
-    const response = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!response.ok) {
-      throw new Error(`Server error: ${response.status}`);
-    }
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
     
-    const roomData = await response.json();
     console.log("Room data from server:", roomData);
     
     return {
@@ -376,10 +667,13 @@ export async function getRoomInfo(roomId) {
       entryFee: roomData.entryFee,
       pool: roomData.entryFee * roomData.players.length,
       gameStarted: roomData.gameStarted,
+      gameId: roomData.gameId,
       winner: roomData.winner,
       createdAt: roomData.createdAt,
       isActive: roomData.isActive,
-      endedAt: roomData.endedAt
+      endedAt: roomData.endedAt,
+      lastActivity: roomData.lastActivity,
+      roomAddress: roomData.roomAddress
     };
   } catch (error) {
     console.error('Error getting room info:', error);
@@ -399,12 +693,11 @@ export async function startGame(roomId, wallet) {
   
   try {
     // 1. Pobierz dane pokoju z serwera
-    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!roomResponse.ok) {
-      throw new Error(`Server error: ${roomResponse.status}`);
-    }
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
     
-    const roomData = await roomResponse.json();
     console.log("Room data from server:", roomData);
     
     // 2. Wygeneruj unikalny identyfikator gry
@@ -455,25 +748,20 @@ export async function startGame(roomId, wallet) {
     console.log("Start game transaction confirmed:", signature);
     
     // 11. Powiadom serwer o rozpoczęciu gry
-    const startResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/start`, {
+    const startResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/start`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         gameId,
-        initiatorAddress: publicKey.toString()
+        initiatorAddress: publicKey.toString(),
+        transactionSignature: signature
       }),
     });
-    
-    if (!startResponse.ok) {
-      throw new Error(`Server error: ${startResponse.status}`);
-    }
     
     // 12. Połącz z serwerem gry przez WebSocket
     await connectToGameServer(roomId, gameId, publicKey.toString());
     
-    console.log("Game started successfully");
+    console.log("Game started successfully:", startResult);
     return gameId;
   } catch (error) {
     console.error('Error starting game:', error);
@@ -493,13 +781,12 @@ export async function endGame(roomId, winnerAddress, wallet) {
   
   try {
     // 1. Pobierz dane pokoju z serwera
-    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!roomResponse.ok) {
-      throw new Error(`Server error: ${roomResponse.status}`);
-    }
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
     
-    const roomData = await roomResponse.json();
-    console.log("Room data from server:", roomData);
+    console.log("Room data for ending game:", roomData);
     
     // 2. Pobierz adres PDA pokoju
     const roomPDA = new PublicKey(roomData.roomAddress);
@@ -549,22 +836,17 @@ export async function endGame(roomId, winnerAddress, wallet) {
     console.log("End game transaction confirmed:", signature);
     
     // 11. Powiadom serwer o zakończeniu gry
-    const endResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/end`, {
+    const endResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/end`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        winnerAddress: winnerAddress
+        winnerAddress: winnerAddress,
+        transactionSignature: signature
       }),
     });
     
-    if (!endResponse.ok) {
-      throw new Error(`Server error: ${endResponse.status}`);
-    }
-    
-    console.log("Game ended successfully");
-    return true;
+    console.log("Game ended successfully:", endResult);
+    return endResult;
   } catch (error) {
     console.error('Error ending game:', error);
     throw error;
@@ -583,13 +865,12 @@ export async function claimPrize(roomId, wallet) {
   
   try {
     // 1. Pobierz dane pokoju z serwera
-    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!roomResponse.ok) {
-      throw new Error(`Server error: ${roomResponse.status}`);
-    }
+    const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
     
-    const roomData = await roomResponse.json();
-    console.log("Room data from server:", roomData);
+    console.log("Room data for claiming prize:", roomData);
     
     // 2. Sprawdź, czy gracz jest zwycięzcą
     if (roomData.winner !== publicKey.toString()) {
@@ -647,19 +928,14 @@ export async function claimPrize(roomId, wallet) {
     console.log("Claim prize transaction confirmed:", signature);
     
     // 12. Powiadom serwer o odebraniu nagrody
-    const claimResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/claim`, {
+    const claimResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/claim`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        claimerAddress: publicKey.toString()
+        claimerAddress: publicKey.toString(),
+        transactionSignature: signature
       }),
     });
-    
-    if (!claimResponse.ok) {
-      throw new Error(`Server error: ${claimResponse.status}`);
-    }
     
     const prize = roomData.entryFee * roomData.players.length;
     
@@ -675,148 +951,87 @@ export async function claimPrize(roomId, wallet) {
   }
 }
 
-// Funkcja anulowania pokoju
-export async function cancelRoom(roomId, wallet) {
-  console.log("Cancelling room:", roomId);
-  
-  const { publicKey, signTransaction } = wallet;
-  
-  if (!publicKey) {
-    throw new Error('Portfel nie jest połączony');
-  }
-  
-  try {
-    // 1. Pobierz dane pokoju z serwera
-    const roomResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`);
-    if (!roomResponse.ok) {
-      throw new Error(`Server error: ${roomResponse.status}`);
-    }
-    
-    const roomData = await roomResponse.json();
-    console.log("Room data from server:", roomData);
-    
-    // 2. Sprawdź, czy użytkownik jest twórcą pokoju
-    if (roomData.creatorAddress !== publicKey.toString()) {
-      throw new Error('Tylko twórca może anulować pokój');
-    }
-    
-    // 3. Pobierz adres PDA pokoju
-    const roomPDA = new PublicKey(roomData.roomAddress);
-    
-    // 4. Serializuj dane instrukcji
-    const data = serializeCancelRoomData();
-    
-    // 5. Przygotuj listę kluczy do instrukcji
-    const keys = [
-      { pubkey: publicKey, isSigner: true, isWritable: true },
-      { pubkey: roomPDA, isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ];
-    
-    // 6. Dodaj klucze dla każdego gracza do zwrotu wpisowego
-    for (const playerAddress of roomData.players) {
-      if (playerAddress !== publicKey.toString()) {
-        keys.push({
-          pubkey: new PublicKey(playerAddress),
-          isSigner: false,
-          isWritable: true
-        });
-      }
-    }
-    
-    // 7. Utwórz instrukcję
-    const instruction = new TransactionInstruction({
-      keys,
-      programId: PROGRAM_ID,
-      data: data
-    });
-    
-    // 8. Utwórz transakcję
-    const transaction = new Transaction().add(instruction);
-    
-    // 9. Pobierz ostatni blok
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = publicKey;
-    
-    // 10. Podpisz transakcję
-    let signedTransaction;
-    try {
-      signedTransaction = await signTransaction(transaction);
-    } catch (signError) {
-      throw new Error(`Błąd podpisu: ${signError.message}`);
-    }
-    
-    // 11. Wyślij transakcję
-    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
-    
-    // 12. Poczekaj na potwierdzenie
-    await connection.confirmTransaction({
-      blockhash,
-      lastValidBlockHeight,
-      signature
-    }, 'confirmed');
-    
-    console.log("Cancel room transaction confirmed:", signature);
-    
-    // 13. Powiadom serwer o anulowaniu pokoju
-    const cancelResponse = await fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/cancel`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        creatorAddress: publicKey.toString()
-      }),
-    });
-    
-    if (!cancelResponse.ok) {
-      throw new Error(`Server error: ${cancelResponse.status}`);
-    }
-    
-    console.log("Room cancelled successfully");
-    return true;
-  } catch (error) {
-    console.error('Error cancelling room:', error);
-    throw error;
-  }
-}
-
-// ---- FUNKCJE SOCKET.IO DLA GRY W CZASIE RZECZYWISTYM ----
+// ========== FUNKCJE SOCKET.IO DLA GRY W CZASIE RZECZYWISTYM ==========
 
 // Połączenie z serwerem gry przez Socket.IO
 export function connectToGameServer(roomId, gameId, playerAddress) {
   console.log("Connecting to game server:", { roomId, gameId, playerAddress });
   
   return new Promise((resolve, reject) => {
-    // Rozłącz poprzednie połączenie, jeśli istnieje
-    if (socket) {
-      socket.disconnect();
-    }
+    // Inicjalizuj Socket.IO
+    const socket = initializeSocket();
     
-    // Inicjalizuj nowe połączenie
-    socket = io(GAME_SERVER_URL);
-    
-    // Obsługa zdarzenia połączenia
-    socket.on('connect', () => {
-      console.log("Connected to game server with socket ID:", socket.id);
-      
-      // Dołącz do pokoju
+    if (socket.connected) {
+      console.log("Socket already connected, joining game room");
       socket.emit('join_game', { roomId, gameId, playerAddress });
       
-      resolve(true);
-    });
-    
-    // Obsługa błędów
-    socket.on('connect_error', (error) => {
-      console.error("Socket.IO connection error:", error);
-      reject(error);
-    });
-    
-    socket.on('error', (error) => {
-      console.error("Socket.IO error:", error);
-      reject(error);
-    });
+      // Ustaw handler dla potwierdzenia dołączenia
+      const joinHandler = (data) => {
+        if (data.roomId === roomId) {
+          console.log("Joined game room successfully:", data);
+          socket.off('join_game_confirm', joinHandler);
+          resolve(true);
+        }
+      };
+      
+      socket.on('join_game_confirm', joinHandler);
+      
+      // Ustaw timeout na połączenie
+      const timeoutId = setTimeout(() => {
+        socket.off('join_game_confirm', joinHandler);
+        reject(new Error('Timeout connecting to game server'));
+      }, 10000);
+      
+      // Ustaw handler dla błędów
+      const errorHandler = (error) => {
+        console.error("Error joining game room:", error);
+        socket.off('join_game_confirm', joinHandler);
+        socket.off('error', errorHandler);
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      
+      socket.on('error', errorHandler);
+    } else {
+      console.log("Socket not connected, waiting for connection");
+      
+      // Przygotuj handler dla połączenia
+      const connectHandler = () => {
+        console.log("Socket connected, joining game room");
+        socket.emit('join_game', { roomId, gameId, playerAddress });
+        
+        // Ustaw handler dla potwierdzenia dołączenia
+        const joinHandler = (data) => {
+          if (data.roomId === roomId) {
+            console.log("Joined game room successfully:", data);
+            socket.off('join_game_confirm', joinHandler);
+            socket.off('connect', connectHandler);
+            resolve(true);
+          }
+        };
+        
+        socket.on('join_game_confirm', joinHandler);
+      };
+      
+      socket.on('connect', connectHandler);
+      
+      // Ustaw timeout na połączenie
+      const timeoutId = setTimeout(() => {
+        socket.off('connect', connectHandler);
+        reject(new Error('Timeout connecting to game server'));
+      }, 15000);
+      
+      // Ustaw handler dla błędów
+      const errorHandler = (error) => {
+        console.error("Error connecting to game server:", error);
+        socket.off('connect', connectHandler);
+        socket.off('error', errorHandler);
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      
+      socket.on('error', errorHandler);
+    }
   });
 }
 
@@ -830,57 +1045,107 @@ export async function getGameState(roomId, wallet) {
     throw new Error('Portfel nie jest połączony');
   }
   
+  const playerAddress = publicKey.toString();
+  
+  // Upewnij się, że socket.io jest zainicjalizowane
+  const socket = initializeSocket();
+  
   return new Promise((resolve, reject) => {
-    if (!socket || !socket.connected) {
-      // Jeśli socket nie jest podłączony, spróbuj go ponownie podłączyć
-      fetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`)
-        .then(response => response.json())
-        .then(roomData => {
-          connectToGameServer(roomId, roomData.gameId, publicKey.toString())
-            .then(() => {
-              socket.emit('get_game_state', { roomId, playerAddress: publicKey.toString() });
-              socket.once('game_state', (gameState) => {
-                resolve(gameState);
-              });
-            })
-            .catch(error => {
-              reject(error);
-            });
+    // Jeśli socket jest już połączony, zażądaj stanu gry
+    if (socket.connected) {
+      const requestId = Date.now().toString();
+      
+      console.log("Requesting game state:", { roomId, playerAddress, requestId });
+      socket.emit('get_game_state', { roomId, playerAddress, requestId });
+      
+      // Ustaw handler dla odpowiedzi
+      const gameStateHandler = (data) => {
+        if (data.requestId === requestId) {
+          console.log("Received game state:", { roomId, requestId });
+          socket.off('game_state', gameStateHandler);
+          resolve(data.gameState);
+        }
+      };
+      
+      socket.on('game_state', gameStateHandler);
+      
+      // Ustaw timeout na odpowiedź
+      const timeoutId = setTimeout(() => {
+        socket.off('game_state', gameStateHandler);
+        
+        // Alternatywnie, spróbuj pobrać dane przez REST API
+        console.log("Socket timeout, trying REST API");
+        retryFetch(`${GAME_SERVER_URL}/api/game/${roomId}/state?playerAddress=${encodeURIComponent(playerAddress)}`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' }
         })
-        .catch(error => {
-          reject(error);
-        });
+          .then(gameState => resolve(gameState))
+          .catch(error => reject(error));
+      }, 5000);
+      
+      // Ustaw handler dla błędów
+      const errorHandler = (error) => {
+        console.error("Error getting game state:", error);
+        socket.off('game_state', gameStateHandler);
+        socket.off('error', errorHandler);
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      
+      socket.on('error', errorHandler);
     } else {
-      // Socket jest już podłączony
-      socket.emit('get_game_state', { roomId, playerAddress: publicKey.toString() });
-      socket.once('game_state', (gameState) => {
-        resolve(gameState);
-      });
+      // Spróbuj pobrać dane przez REST API, jeśli socket nie jest połączony
+      console.log("Socket not connected, using REST API");
+      retryFetch(`${GAME_SERVER_URL}/api/game/${roomId}/state?playerAddress=${encodeURIComponent(playerAddress)}`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' }
+      })
+        .then(gameState => resolve(gameState))
+        .catch(error => reject(error));
     }
   });
 }
 
 // Nasłuchiwanie na zmiany stanu gry
 export function listenForGameState(roomId, playerAddress, callback) {
-  console.log("Setting up game state listener for:", { roomId, playerAddress });
+  console.log("Setting up game state listener:", { roomId, playerAddress });
   
-  if (!socket || !socket.connected) {
-    console.warn("Socket not connected, game state updates will not be received");
-    return () => {};
-  }
+  // Inicjalizuj Socket.IO
+  const socket = initializeSocket();
   
-  const handleGameStateUpdate = (gameState) => {
-    console.log("Game state update received:", gameState);
-    callback(gameState);
+  // Klucz do mapy subskrypcji
+  const subscriptionKey = JSON.stringify({ roomId, playerAddress });
+  
+  // Zapisz callback w mapie subskrypcji
+  gameStateSubscriptions.set(subscriptionKey, callback);
+  
+  // Ustaw handler dla aktualizacji stanu gry
+  const gameStateUpdateHandler = (data) => {
+    if (data.roomId === roomId) {
+      console.log("Game state update received:", { roomId, timestamp: new Date().toISOString() });
+      callback(data);
+    }
   };
   
-  socket.on('game_state_update', handleGameStateUpdate);
+  // Anuluj poprzednią subskrypcję
+  if (socket) {
+    socket.off('game_state_update', gameStateUpdateHandler);
+  }
   
-  // Zwróć funkcję usuwającą nasłuchiwanie
+  // Nasłuchuj aktualizacji stanu gry
+  socket.on('game_state_update', gameStateUpdateHandler);
+  
+  // Dołącz do pokoju, jeśli socket jest połączony
+  if (socket.connected) {
+    socket.emit('join_game', { roomId, playerAddress });
+  }
+  
+  // Zwróć funkcję do anulowania nasłuchiwania
   return () => {
     if (socket) {
-      socket.off('game_state_update', handleGameStateUpdate);
+      socket.off('game_state_update', gameStateUpdateHandler);
     }
+    gameStateSubscriptions.delete(subscriptionKey);
   };
 }
 
@@ -894,45 +1159,72 @@ export async function playCard(roomId, cardIndex, chosenColor = null, wallet) {
     throw new Error('Portfel nie jest połączony');
   }
   
-  if (!socket || !socket.connected) {
-    throw new Error('Brak połączenia z serwerem gry');
-  }
+  const playerAddress = publicKey.toString();
+  
+  // Inicjalizuj Socket.IO
+  const socket = initializeSocket();
   
   return new Promise((resolve, reject) => {
-    socket.emit('play_card', { 
-      roomId, 
-      playerAddress: publicKey.toString(), 
-      cardIndex, 
-      chosenColor 
-    });
-    
-    socket.once('play_card_result', (result) => {
-      console.log("Play card result:", result);
+    // Jeśli socket jest połączony, wyślij ruch
+    if (socket.connected) {
+      const requestId = Date.now().toString();
       
-      if (result.error) {
-        reject(new Error(result.error));
-      } else {
-        // Sprawdź, czy gra się zakończyła
-        if (result.winner) {
-          // Wywołaj funkcję kończącą grę on-chain
-          endGame(roomId, result.winner, wallet)
-            .then(() => {
-              resolve(result);
-            })
-            .catch(error => {
-              console.error("Error ending game on blockchain:", error);
-              resolve(result); // Mimo błędu, zwróć wynik
-            });
-        } else {
-          resolve(result);
+      console.log("Sending play card request:", { roomId, cardIndex, requestId });
+      socket.emit('play_card', { 
+        roomId, 
+        playerAddress, 
+        cardIndex, 
+        chosenColor,
+        requestId
+      });
+      
+      // Ustaw handler dla odpowiedzi
+      const playCardResultHandler = (data) => {
+        if (data.requestId === requestId) {
+          console.log("Play card result received:", data);
+          socket.off('play_card_result', playCardResultHandler);
+          
+          if (data.error) {
+            reject(new Error(data.error));
+          } else {
+            resolve(data);
+          }
         }
-      }
-    });
-    
-    // Timeout dla odpowiedzi
-    setTimeout(() => {
-      reject(new Error('Timeout: Brak odpowiedzi od serwera gry'));
-    }, 10000);
+      };
+      
+      socket.on('play_card_result', playCardResultHandler);
+      
+      // Ustaw timeout na odpowiedź
+      const timeoutId = setTimeout(() => {
+        socket.off('play_card_result', playCardResultHandler);
+        reject(new Error('Timeout playing card'));
+      }, 10000);
+      
+      // Ustaw handler dla błędów
+      const errorHandler = (error) => {
+        console.error("Error playing card:", error);
+        socket.off('play_card_result', playCardResultHandler);
+        socket.off('error', errorHandler);
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      
+      socket.on('error', errorHandler);
+    } else {
+      // Jeśli socket nie jest połączony, użyj REST API
+      console.log("Socket not connected, using REST API");
+      retryFetch(`${GAME_SERVER_URL}/api/game/${roomId}/play`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerAddress,
+          cardIndex,
+          chosenColor
+        })
+      })
+        .then(result => resolve(result))
+        .catch(error => reject(error));
+    }
   });
 }
 
@@ -946,30 +1238,68 @@ export async function drawCard(roomId, wallet) {
     throw new Error('Portfel nie jest połączony');
   }
   
-  if (!socket || !socket.connected) {
-    throw new Error('Brak połączenia z serwerem gry');
-  }
+  const playerAddress = publicKey.toString();
+  
+  // Inicjalizuj Socket.IO
+  const socket = initializeSocket();
   
   return new Promise((resolve, reject) => {
-    socket.emit('draw_card', { 
-      roomId, 
-      playerAddress: publicKey.toString()
-    });
-    
-    socket.once('draw_card_result', (result) => {
-      console.log("Draw card result:", result);
+    // Jeśli socket jest połączony, wyślij żądanie dobrania karty
+    if (socket.connected) {
+      const requestId = Date.now().toString();
       
-      if (result.error) {
-        reject(new Error(result.error));
-      } else {
-        resolve(result.card);
-      }
-    });
-    
-    // Timeout dla odpowiedzi
-    setTimeout(() => {
-      reject(new Error('Timeout: Brak odpowiedzi od serwera gry'));
-    }, 10000);
+      console.log("Sending draw card request:", { roomId, requestId });
+      socket.emit('draw_card', { 
+        roomId, 
+        playerAddress,
+        requestId
+      });
+      
+      // Ustaw handler dla odpowiedzi
+      const drawCardResultHandler = (data) => {
+        if (data.requestId === requestId) {
+          console.log("Draw card result received:", data);
+          socket.off('draw_card_result', drawCardResultHandler);
+          
+          if (data.error) {
+            reject(new Error(data.error));
+          } else {
+            resolve(data.card);
+          }
+        }
+      };
+      
+      socket.on('draw_card_result', drawCardResultHandler);
+      
+      // Ustaw timeout na odpowiedź
+      const timeoutId = setTimeout(() => {
+        socket.off('draw_card_result', drawCardResultHandler);
+        reject(new Error('Timeout drawing card'));
+      }, 10000);
+      
+      // Ustaw handler dla błędów
+      const errorHandler = (error) => {
+        console.error("Error drawing card:", error);
+        socket.off('draw_card_result', drawCardResultHandler);
+        socket.off('error', errorHandler);
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      
+      socket.on('error', errorHandler);
+    } else {
+      // Jeśli socket nie jest połączony, użyj REST API
+      console.log("Socket not connected, using REST API");
+      retryFetch(`${GAME_SERVER_URL}/api/game/${roomId}/draw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerAddress
+        })
+      })
+        .then(result => resolve(result.card))
+        .catch(error => reject(error));
+    }
   });
 }
 
@@ -977,6 +1307,196 @@ export async function drawCard(roomId, wallet) {
 export async function autoSkipTurn(roomId, wallet) {
   console.log("Auto skipping turn due to inactivity:", roomId);
   
-  // Wywołaj funkcję dobierania karty, która automatycznie przesunie turę
-  return await drawCard(roomId, wallet);
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  const playerAddress = publicKey.toString();
+  
+  try {
+    // Wywołaj funkcję dobierania karty, która automatycznie przesunie turę
+    const result = await drawCard(roomId, wallet);
+    return result;
+  } catch (error) {
+    console.error("Error auto-skipping turn:", error);
+    throw error;
+  }
+}
+
+// ========== FUNKCJE POMOCNICZE SPECYFICZNE DLA SOLANA ==========
+
+// Funkcja do sprawdzania salda portfela
+export async function checkWalletBalance(wallet) {
+  const { publicKey } = wallet;
+  
+  if (!publicKey) {
+    throw new Error('Portfel nie jest połączony');
+  }
+  
+  try {
+    const balance = await connection.getBalance(publicKey);
+    return balance / LAMPORTS_PER_SOL;
+  } catch (error) {
+    console.error('Error checking wallet balance:', error);
+    throw error;
+  }
+}
+
+// Funkcja do sprawdzania czy program istnieje
+export async function checkProgramExists(programId = PROGRAM_ID) {
+  try {
+    const accountInfo = await connection.getAccountInfo(programId);
+    
+    if (!accountInfo) {
+      console.error('Program does not exist at address:', programId.toString());
+      return false;
+    }
+    
+    console.log('Program exists:', {
+      address: programId.toString(),
+      executable: accountInfo.executable,
+      owner: accountInfo.owner.toString(),
+      lamports: accountInfo.lamports,
+      dataLength: accountInfo.data.length
+    });
+    
+    return accountInfo.executable;
+  } catch (error) {
+    console.error('Error checking program:', error);
+    return false;
+  }
+}
+
+// Funkcja do sprawdzania stanu pokoju w łańcuchu
+export async function getRoomStateFromChain(roomAddress) {
+  try {
+    const accountInfo = await connection.getAccountInfo(new PublicKey(roomAddress));
+    
+    if (!accountInfo) {
+      throw new Error('Pokój nie istnieje na blockchainie');
+    }
+    
+    // Deserializacja danych pokoju z formatu Borsh
+    // Implementacja zależy od Twojego dokładnego schematu danych
+    
+    return {
+      exists: true,
+      data: accountInfo.data,
+      lamports: accountInfo.lamports,
+      owner: accountInfo.owner.toString(),
+      executable: accountInfo.executable,
+      rentEpoch: accountInfo.rentEpoch
+    };
+  } catch (error) {
+    console.error('Error getting room state from chain:', error);
+    throw error;
+  }
+}
+
+// Funkcja do testowania serializacji danych (dla debugowania)
+export function testSerialization() {
+  console.log("=== Testing Serialization ===");
+  
+  try {
+    // Test CreateRoom
+    console.log("1. Testing CreateRoom serialization...");
+    const createRoomData = serializeCreateRoomData(2, 0.1);
+    console.log("✓ CreateRoom serialization successful");
+    console.log("  Data length:", createRoomData.length);
+    console.log("  Expected: 10 bytes (1 + 1 + 8)");
+    
+    // Test JoinRoom
+    console.log("2. Testing JoinRoom serialization...");
+    const joinRoomData = serializeJoinRoomData();
+    console.log("✓ JoinRoom serialization successful");
+    console.log("  Data length:", joinRoomData.length);
+    
+    // Test StartGame
+    console.log("3. Testing StartGame serialization...");
+    const startGameData = serializeStartGameData("test_game_123");
+    console.log("✓ StartGame serialization successful");
+    console.log("  Data length:", startGameData.length);
+    
+    console.log("=== All serialization tests passed ===");
+    return true;
+  } catch (error) {
+    console.error("❌ Serialization test failed:", error);
+    return false;
+  }
+}
+
+// Funkcja do testowania połączenia z siecią Solana
+export async function testSolanaConnection() {
+  try {
+    console.log('Testing Solana connection...');
+    const version = await connection.getVersion();
+    console.log('Solana RPC version:', version);
+    
+    const slot = await connection.getSlot();
+    console.log('Current slot:', slot);
+    
+    const programExists = await checkProgramExists();
+    console.log('Program exists and is executable:', programExists);
+    
+    return {
+      connected: true,
+      version,
+      slot,
+      programExists,
+      network: NETWORK,
+      rpcUrl: connection.rpcEndpoint
+    };
+  } catch (error) {
+    console.error('Solana connection test failed:', error);
+    return {
+      connected: false,
+      error: error.message,
+      network: NETWORK,
+      rpcUrl: connection.rpcEndpoint
+    };
+  }
+}
+
+// Eksport dodatkowych stałych i funkcji, które mogą być przydatne dla innych komponentów
+export const LAMPORTS = LAMPORTS_PER_SOL;
+export const NETWORK_URL = clusterApiUrl(NETWORK);
+export const CONNECTION = connection;
+
+// Inicjalizacja i test połączenia przy załadowaniu modułu
+let connectionTested = false;
+
+export async function initializeSolanaConnection() {
+  if (connectionTested) return;
+  
+  console.log('Initializing Solana connection...');
+  
+  // Test serializacji danych
+  console.log('Testing data serialization...');
+  const serializationResult = testSerialization();
+  
+  if (!serializationResult) {
+    console.error('Serialization test failed - check data formats');
+    connectionTested = true;
+    return { 
+      connected: false, 
+      programExists: false, 
+      error: 'Serialization test failed' 
+    };
+  }
+  
+  // Test połączenia z Solana
+  const testResult = await testSolanaConnection();
+  
+  if (!testResult.connected) {
+    console.error('Failed to connect to Solana:', testResult.error);
+  } else if (!testResult.programExists) {
+    console.error('Program does not exist or is not executable');
+  } else {
+    console.log('✓ Solana connection initialized successfully');
+  }
+  
+  connectionTested = true;
+  return testResult;
 }
