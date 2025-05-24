@@ -1,7 +1,83 @@
 // server/routes/index.js
 const express = require('express');
 const router = express.Router();
-const { PublicKey } = require('@solana/web3.js');
+const { PublicKey, Transaction, TransactionInstruction, SystemProgram } = require('@solana/web3.js');
+const UnoGame = require('../game/UnoGame');
+
+// Funkcja do serializacji instrukcji EndGame
+function serializeEndGameData(winnerPubkey) {
+  const buffer = Buffer.alloc(1 + 32); // 1 bajt instrukcji + 32 bajty pubkey
+  
+  // Instrukcja EndGame (3)
+  buffer.writeUInt8(3, 0);
+  
+  // Winner Pubkey (32 bajty)
+  const winnerPubkeyBuffer = winnerPubkey.toBuffer();
+  winnerPubkeyBuffer.copy(buffer, 1);
+  
+  console.log("Serialized EndGame data:", {
+    instruction: buffer[0],
+    winner: winnerPubkey.toString(),
+    bufferLength: buffer.length
+  });
+  
+  return buffer;
+}
+
+// Funkcja do wywołania EndGame na blockchainie przez serwer
+async function callEndGameOnChain(connection, programId, serverKeyPair, roomId, winnerAddress, roomAddress) {
+  console.log("Server calling EndGame on chain:", { roomId, winnerAddress, roomAddress });
+  
+  if (!serverKeyPair) {
+    throw new Error('Server keypair not available for signing transactions');
+  }
+  
+  try {
+    // Utwórz PublicKey dla zwycięzcy i pokoju
+    const winnerPubkey = new PublicKey(winnerAddress);
+    const roomPubkey = new PublicKey(roomAddress);
+    
+    // Serializuj dane instrukcji
+    const data = serializeEndGameData(winnerPubkey);
+    
+    // Utwórz instrukcję
+    const instruction = new TransactionInstruction({
+      keys: [
+        { pubkey: serverKeyPair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: roomPubkey, isSigner: false, isWritable: true },
+      ],
+      programId: programId,
+      data: data
+    });
+    
+    // Utwórz transakcję
+    const transaction = new Transaction().add(instruction);
+    
+    // Pobierz ostatni blok
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = serverKeyPair.publicKey;
+    
+    // Podpisz transakcję
+    transaction.sign(serverKeyPair);
+    
+    // Wyślij transakcję
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    
+    // Poczekaj na potwierdzenie
+    await connection.confirmTransaction({
+      blockhash,
+      lastValidBlockHeight,
+      signature
+    }, 'confirmed');
+    
+    console.log("EndGame transaction confirmed:", signature);
+    return { signature, success: true };
+  } catch (error) {
+    console.error('Error calling EndGame on chain:', error);
+    throw error;
+  }
+}
 
 // Obsługa tras związanych z pokojami
 router.get('/rooms', async (req, res) => {
@@ -75,7 +151,7 @@ router.post('/rooms', async (req, res) => {
     }
     
     // Generuj unikalny identyfikator
-    const roomId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const roomId = `room_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     
     // Utwórz pokój
     const room = {
@@ -91,7 +167,8 @@ router.post('/rooms', async (req, res) => {
       isActive: true,
       gameId: null,
       lastActivity: new Date().toISOString(),
-      transactionSignature
+      transactionSignature,
+      blockchainEnded: false // NOWE POLE
     };
     
     // Zapisz pokój
@@ -118,7 +195,7 @@ router.post('/rooms', async (req, res) => {
       io.emit('rooms_update', rooms);
     }
     
-    res.status(201).json({ roomId });
+    res.status(201).json({ roomId, ...room });
   } catch (error) {
     console.error('Error creating room:', error);
     res.status(500).json({ error: 'Failed to create room' });
@@ -181,10 +258,11 @@ router.post('/rooms/:id/join', async (req, res) => {
     // Powiadom graczy w pokoju
     const io = req.app.get('socketIo');
     if (io) {
-      io.to(`room_${roomId}`).emit('room_update', room);
+      io.to(`room_${roomId}`).emit(`room_update_${roomId}`, room);
+      io.emit('rooms_update', Array.from(activeRooms.values()));
     }
     
-    res.status(200).json({ success: true });
+    res.status(200).json({ success: true, room });
   } catch (error) {
     console.error('Error joining room:', error);
     res.status(500).json({ error: 'Failed to join room' });
@@ -217,6 +295,11 @@ router.post('/rooms/:id/start', async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to start the game' });
     }
     
+    // Sprawdź minimalną liczbę graczy
+    if (room.players.length < 2) {
+      return res.status(400).json({ error: 'Not enough players' });
+    }
+    
     // Weryfikacja transakcji (opcjonalna)
     if (transactionSignature) {
       try {
@@ -237,6 +320,7 @@ router.post('/rooms/:id/start', async (req, res) => {
     // Rozpocznij grę
     room.gameStarted = true;
     room.gameId = gameId;
+    room.gameStartedAt = new Date().toISOString();
     room.lastActivity = new Date().toISOString();
     
     // Zapisz zaktualizowany pokój
@@ -244,25 +328,25 @@ router.post('/rooms/:id/start', async (req, res) => {
     
     // Inicjalizuj stan gry
     const gameStates = req.app.get('gameStates');
-    const UnoGame = require('../game/UnoGame');
     const game = new UnoGame(roomId, room.players);
     gameStates.set(roomId, game);
     
     // Powiadom graczy w pokoju
     const io = req.app.get('socketIo');
     if (io) {
-      io.to(`room_${roomId}`).emit('room_update', room);
-      io.to(`room_${roomId}`).emit('game_started', { gameId });
+      io.to(`room_${roomId}`).emit(`room_update_${roomId}`, room);
+      io.emit('rooms_update', Array.from(activeRooms.values()));
     }
     
-    res.status(200).json({ success: true });
+    console.log(`Game started in room ${roomId}`);
+    res.status(200).json({ success: true, gameId });
   } catch (error) {
     console.error('Error starting game:', error);
     res.status(500).json({ error: 'Failed to start game' });
   }
 });
 
-// Zakończ grę
+// Zakończ grę - ZMODYFIKOWANA
 router.post('/rooms/:id/end', async (req, res) => {
   try {
     const roomId = req.params.id;
@@ -284,7 +368,7 @@ router.post('/rooms/:id/end', async (req, res) => {
       return res.status(400).json({ error: 'Winner is not a player in this room' });
     }
     
-    // Weryfikacja transakcji (opcjonalna)
+    // Weryfikacja transakcji
     if (transactionSignature) {
       try {
         const verifyTransaction = req.app.get('verifyTransaction');
@@ -297,36 +381,37 @@ router.post('/rooms/:id/end', async (req, res) => {
         console.log(`Transaction ${transactionSignature} verified:`, txInfo);
       } catch (verifyError) {
         console.error('Error verifying transaction:', verifyError);
-        // Możemy zdecydować, czy kontynuować mimo błędu weryfikacji
+        return res.status(400).json({ error: 'Failed to verify transaction' });
       }
     }
     
     // Zakończ grę
     room.winner = winnerAddress;
     room.isActive = false;
+    room.blockchainEnded = true; // WAŻNE: oznacz jako zakończone na blockchainie
     room.endedAt = new Date().toISOString();
     room.lastActivity = new Date().toISOString();
+    room.endTransactionSignature = transactionSignature;
     
     // Zapisz zaktualizowany pokój
     activeRooms.set(roomId, room);
     
-    // Aktualizuj stan gry
+    // Usuń grę ze stanów
     const gameStates = req.app.get('gameStates');
-    const game = gameStates.get(roomId);
-    
-    if (game) {
-      game.winner = winnerAddress;
-      game.isActive = false;
-    }
+    gameStates.delete(roomId);
     
     // Powiadom graczy w pokoju
     const io = req.app.get('socketIo');
     if (io) {
-      io.to(`room_${roomId}`).emit('room_update', room);
-      io.to(`room_${roomId}`).emit('game_ended', { winner: winnerAddress });
+      io.to(`room_${roomId}`).emit('game_ended', { 
+        winner: winnerAddress,
+        blockchainConfirmed: true 
+      });
+      io.emit('rooms_update', Array.from(activeRooms.values()));
     }
     
-    res.status(200).json({ success: true });
+    console.log(`Game ended in room ${roomId}, winner: ${winnerAddress}`);
+    res.status(200).json({ success: true, winner: winnerAddress });
   } catch (error) {
     console.error('Error ending game:', error);
     res.status(500).json({ error: 'Failed to end game' });
@@ -425,65 +510,56 @@ router.post('/rooms/:id/leave', async (req, res) => {
       return res.status(400).json({ error: 'Player is not in this room' });
     }
     
-    // Zapisz, czy pokój był aktywny przed opuszczeniem
-    const wasActive = room.isActive && room.gameStarted && !room.winner;
+    // Usuń gracza z pokoju
+    room.players.splice(playerIndex, 1);
+    room.lastActivity = new Date().toISOString();
     
-    // Jeśli gra jest w toku, a gracz opuszcza pokój, ustaw przeciwnika jako zwycięzcę
-    if (wasActive && room.players.length === 2) {
-      const opponentAddress = room.players.find(p => p !== playerAddress);
-      
+    let wasActive = room.gameStarted && room.isActive;
+    let opponentWins = false;
+    let opponentAddress = null;
+    
+    // Jeśli gra była aktywna i został tylko jeden gracz, ten gracz wygrywa
+    if (wasActive && room.players.length === 1) {
+      opponentAddress = room.players[0];
+      opponentWins = true;
       room.winner = opponentAddress;
       room.isActive = false;
       room.endedAt = new Date().toISOString();
-      room.opponentWins = true;
       
-      // Aktualizuj stan gry
+      // Usuń grę ze stanów
       const gameStates = req.app.get('gameStates');
-      const game = gameStates.get(roomId);
+      gameStates.delete(roomId);
       
-      if (game) {
-        game.winner = opponentAddress;
-        game.isActive = false;
-      }
-      
-      // Powiadom graczy w pokoju
+      // Powiadom o wygranej przez walkower
       const io = req.app.get('socketIo');
       if (io) {
-        io.to(`room_${roomId}`).emit('room_update', room);
         io.to(`room_${roomId}`).emit('game_ended', { 
-          winner: opponentAddress,
-          reason: 'opponent_left'
+          winner: opponentAddress, 
+          reason: 'opponent_left' 
         });
       }
-      
-      res.status(200).json({ 
-        success: true, 
-        wasActive, 
-        opponentWins: true,
-        opponentAddress 
-      });
-    } else {
-      // Jeśli gra jeszcze się nie rozpoczęła lub jest więcej graczy, po prostu usuń gracza
-      room.players = room.players.filter(p => p !== playerAddress);
-      
-      // Jeśli to był ostatni gracz, oznacz pokój jako nieaktywny
-      if (room.players.length === 0) {
-        room.isActive = false;
-      }
-      
-      room.lastActivity = new Date().toISOString();
-      
-      // Zapisz zaktualizowany pokój
-      activeRooms.set(roomId, room);
-      
-      // Powiadom graczy w pokoju
-      const io = req.app.get('socketIo');
-      if (io) {
-        io.to(`room_${roomId}`).emit('room_update', room);
-      }
-      
-      res.status(200).json({ success: true, wasActive, opponentWins: false });
     }
+    
+    // Jeśli pokój jest pusty, usuń go
+    if (room.players.length === 0) {
+      activeRooms.delete(roomId);
+    } else {
+      activeRooms.set(roomId, room);
+    }
+    
+    // Emituj aktualizację
+    const io = req.app.get('socketIo');
+    if (io) {
+      io.emit('rooms_update', Array.from(activeRooms.values()));
+    }
+    
+    console.log(`Player ${playerAddress} left room ${roomId}`);
+    res.status(200).json({ 
+      success: true, 
+      wasActive, 
+      opponentWins, 
+      opponentAddress 
+    });
   } catch (error) {
     console.error('Error leaving room:', error);
     res.status(500).json({ error: 'Failed to leave room' });
@@ -516,7 +592,7 @@ router.get('/game/:id/state', async (req, res) => {
   }
 });
 
-// Zagranie karty
+// Zagranie karty - ZMODYFIKOWANA
 router.post('/game/:id/play', async (req, res) => {
   try {
     const roomId = req.params.id;
@@ -536,7 +612,10 @@ router.post('/game/:id/play', async (req, res) => {
     // Wykonaj ruch
     const result = game.playCard(playerAddress, cardIndex, chosenColor);
     
-    // Sprawdź, czy gra się zakończyła
+    // Broadcast game state to all players
+    broadcastGameState(req, roomId, game);
+    
+    // Jeśli ktoś wygrał, aktualizuj pokój
     if (result.winner) {
       const activeRooms = req.app.get('activeRooms');
       const room = activeRooms.get(roomId);
@@ -547,19 +626,44 @@ router.post('/game/:id/play', async (req, res) => {
         room.endedAt = new Date().toISOString();
         room.lastActivity = new Date().toISOString();
         
-        // Zapisz zaktualizowany pokój
-        activeRooms.set(roomId, room);
-        
-        // Powiadom graczy w pokoju
         const io = req.app.get('socketIo');
+        const connection = req.app.get('solanaConnection');
+        const programId = req.app.get('solanaProgram');
+        const serverKeyPair = req.app.get('serverKeyPair'); // Jeśli jest dostępny
+        
+        // Emituj informację o potrzebie zakończenia gry na blockchainie
         if (io) {
-          io.to(`room_${roomId}`).emit('room_update', room);
-          io.to(`room_${roomId}`).emit('game_ended', { winner: playerAddress });
+          io.to(`room_${roomId}`).emit('must_end_game_on_chain', {
+            roomId,
+            winnerAddress: playerAddress
+          });
         }
+        
+        // Jeśli serwer ma klucz, może sam zakończyć grę
+        if (serverKeyPair && room.roomAddress) {
+          console.log("Server attempting to end game on blockchain...");
+          callEndGameOnChain(connection, programId, serverKeyPair, roomId, playerAddress, room.roomAddress)
+            .then(result => {
+              console.log("Game ended on blockchain by server:", result);
+              room.blockchainEnded = true;
+              activeRooms.set(roomId, room);
+              
+              // Powiadom wszystkich o zakończeniu gry
+              if (io) {
+                io.to(`room_${roomId}`).emit('game_ended', { 
+                  winner: playerAddress,
+                  blockchainConfirmed: true 
+                });
+              }
+            })
+            .catch(error => {
+              console.error("Server failed to end game on blockchain:", error);
+              // Nadal pozwól graczowi spróbować
+            });
+        }
+        
+        activeRooms.set(roomId, room);
       }
-    } else {
-      // Powiadom graczy o aktualizacji stanu gry
-      broadcastGameState(req, roomId, game);
     }
     
     res.status(200).json(result);
@@ -604,23 +708,38 @@ function broadcastGameState(req, roomId, game) {
   const io = req.app.get('socketIo');
   const activeRooms = req.app.get('activeRooms');
   const room = activeRooms.get(roomId);
+  const gameStateSubscriptions = req.app.get('gameStateSubscriptions');
   
   if (!io || !room || !room.players) {
     return;
   }
   
+  // Pobierz bazowy stan gry
+  const baseState = game.getGameState();
+  
   // Dla każdego gracza w pokoju
   for (const playerAddress of room.players) {
     try {
+      // Pobierz socket ID gracza jeśli jest dostępny
+      const subscriptionKey = `${roomId}-${playerAddress}`;
+      const socketId = gameStateSubscriptions?.get(subscriptionKey);
+      
       // Pobierz stan gry z perspektywy gracza
       const playerState = game.getGameStateForPlayer(playerAddress);
       
-      // Wyślij stan gry do gracza
-      io.to(roomId).emit('game_state_update', playerState);
+      if (socketId) {
+        // Wyślij stan gry do konkretnego gracza
+        io.to(socketId).emit('game_state_update', playerState);
+      } else {
+        // Fallback - wyślij do pokoju
+        io.to(`room_${roomId}`).emit('game_state_update', playerState);
+      }
     } catch (error) {
       console.error(`Error broadcasting to player ${playerAddress}:`, error);
     }
   }
+  
+  console.log(`Broadcasted game state to all players in room ${roomId}`);
 }
 
 module.exports = router;

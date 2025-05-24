@@ -10,10 +10,10 @@ import {
   drawCard,
   claimPrize,
   leaveGame,
+  endGame,
   autoSkipTurn,
   connectToGameServer,
-  listenForGameState,
-  endGame
+  listenForGameState
 } from '../utils/SolanaTransactions';
 
 // Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
@@ -55,7 +55,8 @@ function GameRoom({ roomId, onBack }) {
   const [connectionStatus, setConnectionStatus] = useState('disconnected'); // disconnected, connecting, connected
   const [error, setError] = useState(null);
   const [unsubscribeGameState, setUnsubscribeGameState] = useState(null);
-  const [isEndingGame, setIsEndingGame] = useState(false);
+  const [blockchainGameEnded, setBlockchainGameEnded] = useState(false);
+  const [socket, setSocket] = useState(null);
 
   // Funkcja łącząca ładowanie informacji o pokoju i stanie gry z deduplikacją
   const loadRoomAndGameInfo = useCallback(async (force = false) => {
@@ -81,6 +82,11 @@ function GameRoom({ roomId, onBack }) {
       const info = await getRoomInfo(roomId);
       console.log("Room info loaded:", info);
       setRoomInfo(info);
+      
+      // Sprawdź czy gra została zakończona na blockchainie
+      if (info.blockchainEnded) {
+        setBlockchainGameEnded(true);
+      }
       
       if (!publicKey) {
         console.log("No public key available");
@@ -131,6 +137,11 @@ function GameRoom({ roomId, onBack }) {
       if (info.winner) {
         setWinner(info.winner);
         setGameStatus('ended');
+        
+        // Jeśli gra ma zwycięzcę i jest oznaczona jako zakończona na blockchainie
+        if (info.blockchainEnded) {
+          setBlockchainGameEnded(true);
+        }
       }
     } catch (error) {
       console.error('Error loading room info:', error);
@@ -162,6 +173,11 @@ function GameRoom({ roomId, onBack }) {
         const playerAddr = publicKey.toString();
         const playerIdx = info.players.indexOf(playerAddr);
         setPlayerIndex(playerIdx);
+        
+        // Sprawdź czy gra została zakończona na blockchainie
+        if (info.blockchainEnded) {
+          setBlockchainGameEnded(true);
+        }
         
         // Ustal status na podstawie danych pokoju
         if (playerIdx !== -1) {
@@ -207,56 +223,6 @@ function GameRoom({ roomId, onBack }) {
     
     loadInitialData();
   }, [roomId, publicKey, wallet, onBack]);
-
-  // Funkcja do zakończenia gry na blockchain
-  const handleEndGame = useCallback(async (winnerAddress) => {
-    if (isEndingGame) {
-      console.log("Already ending game, skipping");
-      return;
-    }
-    
-    try {
-      setIsEndingGame(true);
-      console.log("Ending game on blockchain with winner:", winnerAddress);
-      
-      // Najpierw sprawdź stan na blockchain
-      const currentRoomInfo = await getRoomInfo(roomId);
-      console.log("Current room info from blockchain:", {
-        winner: currentRoomInfo.winner,
-        gameStarted: currentRoomInfo.gameStarted,
-        roomAddress: currentRoomInfo.roomAddress
-      });
-      
-      // Jeśli już jest zwycięzca na blockchain, nie rób nic
-      if (currentRoomInfo.winner) {
-        console.log("Game already has winner on blockchain:", currentRoomInfo.winner);
-        setRoomInfo(currentRoomInfo);
-        return;
-      }
-      
-      // Wywołaj funkcję endGame z SolanaTransactions
-      console.log("Calling endGame transaction...");
-      const result = await endGame(roomId, winnerAddress, wallet);
-      
-      console.log("EndGame transaction result:", result);
-      
-      // Odśwież stan po zakończeniu
-      setTimeout(async () => {
-        await loadRoomAndGameInfo(true);
-      }, 2000);
-      
-    } catch (error) {
-      console.error("Error ending game on blockchain:", error);
-      setError(`Błąd podczas kończenia gry: ${error.message}`);
-      
-      // Pokaż więcej szczegółów w konsoli
-      if (error.logs) {
-        console.error("Transaction logs:", error.logs);
-      }
-    } finally {
-      setIsEndingGame(false);
-    }
-  }, [roomId, wallet, loadRoomAndGameInfo, isEndingGame]);
   
   // Efekt do nasłuchiwania zmian stanu gry
   useEffect(() => {
@@ -279,23 +245,6 @@ function GameRoom({ roomId, onBack }) {
       
       // Aktualizuj stan gry
       updateGameState(updatedGameState);
-      
-      // WAŻNE: Sprawdź czy gra się właśnie zakończyła
-      if (updatedGameState.winner && !winner && gameStatus === 'playing' && !isEndingGame) {
-        console.log("Game just ended! Winner:", updatedGameState.winner);
-        
-        // Natychmiast ustaw zwycięzcę i status
-        setWinner(updatedGameState.winner);
-        setGameStatus('ended');
-        
-        // Jeśli jesteśmy w pokoju i gra się zakończyła, wywołaj endGame na blockchain
-        // Dodaj małe opóźnienie, aby uniknąć wyścigu
-        if (playerIndex >= 0) {
-          setTimeout(() => {
-            handleEndGame(updatedGameState.winner);
-          }, 1000);
-        }
-      }
     });
     
     // Zapisz funkcję anulującą nasłuchiwanie
@@ -305,7 +254,10 @@ function GameRoom({ roomId, onBack }) {
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [roomId, publicKey, isLoading, isGameInitialized, connectionStatus, playerIndex, winner, gameStatus, handleEndGame, isEndingGame]);
+  }, [roomId, publicKey, isLoading, isGameInitialized, connectionStatus]);
+
+  // Handler dla wydarzenia must_end_game_on_chain
+
 
   // Efekt do odliczania czasu dla aktualnego gracza
   useEffect(() => {
@@ -314,7 +266,8 @@ function GameRoom({ roomId, onBack }) {
       gameStatus !== 'playing' ||
       currentPlayerIndex !== playerIndex ||
       !publicKey ||
-      connectionStatus !== 'connected'
+      connectionStatus !== 'connected' ||
+      blockchainGameEnded
     ) {
       setTurnTimer(0);
       return;
@@ -378,7 +331,7 @@ function GameRoom({ roomId, onBack }) {
     return () => {
       clearInterval(interval);
     };
-  }, [gameStatus, currentPlayerIndex, playerIndex, publicKey, maxTurnTime, gameState?.turnStartTime, connectionStatus]);
+  }, [gameStatus, currentPlayerIndex, playerIndex, publicKey, maxTurnTime, gameState?.turnStartTime, connectionStatus, blockchainGameEnded]);
   
   // Efekt do sprawdzania czasu przeciwnika
   useEffect(() => {
@@ -388,7 +341,8 @@ function GameRoom({ roomId, onBack }) {
       !roomId ||
       !wallet ||
       !publicKey ||
-      connectionStatus !== 'connected'
+      connectionStatus !== 'connected' ||
+      blockchainGameEnded
     ) {
       return;
     }
@@ -428,11 +382,11 @@ function GameRoom({ roomId, onBack }) {
     }, 1000);
     
     return () => clearInterval(interval);
-  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo, connectionStatus, maxTurnTime]);
+  }, [gameStatus, currentPlayerIndex, playerIndex, roomId, wallet, publicKey, gameState?.turnStartTime, loadRoomAndGameInfo, connectionStatus, maxTurnTime, blockchainGameEnded]);
   
   // Awaryjne odświeżanie co 15 sekund
   useEffect(() => {
-    if (gameStatus !== 'playing' || !roomId || !wallet || connectionStatus !== 'connected') return;
+    if (gameStatus !== 'playing' || !roomId || !wallet || connectionStatus !== 'connected' || blockchainGameEnded) return;
     
     console.log("Setting up backup refresh interval");
     
@@ -450,7 +404,7 @@ function GameRoom({ roomId, onBack }) {
       console.log("Cleaning up backup refresh");
       clearInterval(interval);
     };
-  }, [roomId, wallet, gameStatus, connectionStatus]);
+  }, [roomId, wallet, gameStatus, connectionStatus, blockchainGameEnded]);
 
   // Usprawniona funkcja aktualizacji stanu gry
   const updateGameState = (state) => {
@@ -466,6 +420,7 @@ function GameRoom({ roomId, onBack }) {
       deckSize: state.deckSize,
       turnStartTime: state.turnStartTime,
       winner: state.winner,
+      isActive: state.isActive,
       timestamp: new Date().toISOString()
     });
     
@@ -481,26 +436,19 @@ function GameRoom({ roomId, onBack }) {
     if (state.direction !== undefined) setDirection(state.direction);
     if (state.lastAction) setLastAction(state.lastAction);
     
-    // Sprawdź czy gra się zakończyła
-    if (state.winner && winner !== state.winner && !isEndingGame) {
-      console.log("Winner detected in updateGameState:", state.winner);
+    // WAŻNE: Sprawdź stan gry na podstawie danych z serwera
+    if (state.winner && state.winner !== winner) {
       setWinner(state.winner);
-      setGameStatus('ended');
-      
-      // Jeśli jesteśmy aktywnym graczem i gra się właśnie zakończyła, wywołaj endGame
-      // Tylko jeśli status był 'playing'
-      if (playerIndex >= 0 && gameStatus === 'playing') {
-        // Dodaj małe opóźnienie, aby uniknąć wyścigu
-        setTimeout(() => {
-          handleEndGame(state.winner);
-        }, 1000);
+      // Tylko ustaw 'ended' jeśli gra rzeczywiście się zakończyła
+      if (state.isActive === false) {
+        setGameStatus('ended');
+        // Nie ustawiaj blockchainGameEnded tutaj - czekaj na potwierdzenie
       }
     }
     
-    // Jeśli to jest tura przeciwnika, aktualizuj timer
-    if (state.currentPlayerIndex !== playerIndex && state.turnStartTime) {
-      const remainingTime = calculateRemainingTime(state.turnStartTime, maxTurnTime);
-      setTurnTimer(remainingTime);
+    // Jeśli gra jest nadal aktywna, upewnij się że status to 'playing'
+    if (state.isActive === true && gameStatus !== 'playing' && !blockchainGameEnded) {
+      setGameStatus('playing');
     }
   };
 
@@ -615,7 +563,8 @@ function GameRoom({ roomId, onBack }) {
     if (
       gameStatus !== 'playing' ||
       currentPlayerIndex !== playerIndex ||
-      connectionStatus !== 'connected'
+      connectionStatus !== 'connected' ||
+      blockchainGameEnded
     ) {
       // Nie twoja kolej lub gra nie jest aktywna
       return;
@@ -666,22 +615,31 @@ function GameRoom({ roomId, onBack }) {
       const result = await playCard(roomId, cardIndex, null, wallet);
       console.log("Play card result:", result);
       
-      // Sprawdź czy gracz wygrał
-      if (result.winner) {
-        console.log("Player won the game:", result.winner);
-        setWinner(result.winner);
-        setGameStatus('ended');
+      // Jeśli wygrałeś
+      if (result.winner === publicKey.toString()) {
+        console.log("I won! Game should be ending on blockchain...");
+        setWinner(publicKey.toString());
         
-        // Wywołaj endGame na blockchain tylko raz
-        if (!isEndingGame) {
-          setTimeout(() => {
-            handleEndGame(result.winner);
-          }, 1000);
+        // Jeśli gra została automatycznie zakończona na blockchainie
+        if (result.gameEndedOnChain) {
+          console.log("Game was ended on blockchain automatically");
+          setBlockchainGameEnded(true);
+          setGameStatus('ended');
+        } else if (result.endGameError) {
+          console.error("Failed to end game on blockchain:", result.endGameError);
+          setError("Wygrałeś! Ale wystąpił błąd przy kończeniu gry na blockchainie. Spróbuj odebrać nagrodę ręcznie.");
         }
-      } else if (result.error) {
-        // Przywróć stan ręki jeśli wystąpił błąd
-        await loadRoomAndGameInfo(true);
       }
+      
+      // Odśwież stan gry po zagraniu karty
+      setTimeout(async () => {
+        try {
+          await loadRoomAndGameInfo(true);
+        } catch (refreshError) {
+          console.error("Error refreshing after play:", refreshError);
+        }
+      }, 1000);
+      
     } catch (error) {
       console.error('Error playing card:', error);
       setError(`Błąd podczas zagrywania karty: ${error.message}`);
@@ -715,22 +673,31 @@ function GameRoom({ roomId, onBack }) {
       
       setSelectedCard(null);
       
-      // Sprawdź czy gracz wygrał
-      if (result.winner) {
-        console.log("Player won the game:", result.winner);
-        setWinner(result.winner);
-        setGameStatus('ended');
+      // Jeśli wygrałeś
+      if (result.winner === publicKey.toString()) {
+        console.log("I won with wild card! Game should be ending on blockchain...");
+        setWinner(publicKey.toString());
         
-        // Wywołaj endGame na blockchain tylko raz
-        if (!isEndingGame) {
-          setTimeout(() => {
-            handleEndGame(result.winner);
-          }, 1000);
+        // Jeśli gra została automatycznie zakończona na blockchainie
+        if (result.gameEndedOnChain) {
+          console.log("Game was ended on blockchain automatically");
+          setBlockchainGameEnded(true);
+          setGameStatus('ended');
+        } else if (result.endGameError) {
+          console.error("Failed to end game on blockchain:", result.endGameError);
+          setError("Wygrałeś! Ale wystąpił błąd przy kończeniu gry na blockchainie. Spróbuj odebrać nagrodę ręcznie.");
         }
-      } else if (result.error) {
-        // Przywróć stan ręki jeśli wystąpił błąd
-        await loadRoomAndGameInfo(true);
       }
+      
+      // Odśwież stan gry
+      setTimeout(async () => {
+        try {
+          await loadRoomAndGameInfo(true);
+        } catch (refreshError) {
+          console.error("Error refreshing after wild play:", refreshError);
+        }
+      }, 1000);
+      
     } catch (error) {
       console.error('Error playing wild card:', error);
       setError(`Błąd podczas zagrywania karty: ${error.message}`);
@@ -747,7 +714,8 @@ function GameRoom({ roomId, onBack }) {
     if (
       gameStatus !== 'playing' ||
       currentPlayerIndex !== playerIndex ||
-      connectionStatus !== 'connected'
+      connectionStatus !== 'connected' ||
+      blockchainGameEnded
     ) {
       // Nie twoja kolej lub gra nie jest aktywna
       return;
@@ -781,8 +749,32 @@ function GameRoom({ roomId, onBack }) {
 
   // Odebranie nagrody
   const handleClaimPrize = async () => {
-    if (gameStatus !== 'ended' || winner !== publicKey?.toString()) {
-      // Tylko zwycięzca może odebrać nagrodę po zakończeniu gry
+    if (gameStatus !== 'ended' || winner !== publicKey?.toString() || !blockchainGameEnded) {
+      // Tylko zwycięzca może odebrać nagrodę po zakończeniu gry na blockchainie
+      console.log("Cannot claim prize:", { 
+        gameStatus, 
+        winner, 
+        myAddress: publicKey?.toString(),
+        blockchainGameEnded 
+      });
+      
+      // Jeśli jesteś zwycięzcą ale gra nie została zakończona na blockchainie
+      if (winner === publicKey?.toString() && !blockchainGameEnded) {
+        setError("Gra musi być najpierw zakończona na blockchainie. Spróbuj zakończyć grę.");
+        
+        // Spróbuj zakończyć grę
+        try {
+          setIsLoading(true);
+          await endGame(roomId, publicKey.toString(), wallet);
+          setBlockchainGameEnded(true);
+          await loadRoomAndGameInfo(true);
+        } catch (error) {
+          console.error("Error ending game:", error);
+          setError(`Błąd podczas kończenia gry: ${error.message}`);
+        } finally {
+          setIsLoading(false);
+        }
+      }
       return;
     }
 
@@ -803,7 +795,7 @@ function GameRoom({ roomId, onBack }) {
   // Obsługa przycisku powrotu
   const handleBackButton = async () => {
     // Jeśli gra jest w toku i pokój jest pełny, potwierdzenie
-    if (gameStatus === 'playing' && roomInfo?.currentPlayers > 1) {
+    if (gameStatus === 'playing' && roomInfo?.currentPlayers > 1 && !blockchainGameEnded) {
       const confirmLeave = window.confirm("Czy na pewno chcesz opuścić grę? Spowoduje to automatyczną przegraną i przeciwnik zostanie zwycięzcą!");
       
       if (confirmLeave) {
@@ -849,7 +841,7 @@ function GameRoom({ roomId, onBack }) {
       
       console.log("GameRoom component unmounting, cleaning up resources");
     };
-  }, []);
+  }, [unsubscribeGameState]);
 
   // Renderowanie karty UNO
   const renderUnoCard = (card, index, isPlayerHand = false) => {
@@ -875,6 +867,7 @@ function GameRoom({ roomId, onBack }) {
       isPlayerHand &&
       currentCard && // Dodaj sprawdzenie, czy currentCard istnieje
       connectionStatus === 'connected' &&
+      !blockchainGameEnded &&
       (card.color === currentCard.color || card.value === currentCard.value || card.color === 'black');
     
     const cardClasses = `uno-card ${card.color} ${isPlayable ? '' : 'disabled'}`;
@@ -1024,6 +1017,28 @@ function GameRoom({ roomId, onBack }) {
       {/* Status połączenia */}
       {renderConnectionStatus()}
       
+      {/* Debug info - tylko w trybie development */}
+      {process.env.NODE_ENV === 'development' && (
+        <div className="debug-info" style={{
+          background: '#f0f0f0', 
+          padding: '10px', 
+          margin: '10px 0',
+          fontSize: '12px',
+          fontFamily: 'monospace'
+        }}>
+          <div>Debug Info:</div>
+          <div>gameStatus: {gameStatus}</div>
+          <div>isActive: {gameState?.isActive?.toString()}</div>
+          <div>winner: {winner || 'none'}</div>
+          <div>blockchainGameEnded: {blockchainGameEnded.toString()}</div>
+          <div>currentPlayerIndex: {currentPlayerIndex}</div>
+          <div>playerIndex: {playerIndex}</div>
+          <div>connectionStatus: {connectionStatus}</div>
+          <div>playerHand length: {playerHand?.length || 0}</div>
+          <div>roomInfo.blockchainEnded: {roomInfo?.blockchainEnded?.toString() || 'unknown'}</div>
+        </div>
+      )}
+      
       {/* Ekran dołączania do pokoju */}
       {gameStatus === 'joining' && (
         <div className="joining-section">
@@ -1072,7 +1087,7 @@ function GameRoom({ roomId, onBack }) {
             </div>
             
             <div>
-              {gameStatus === 'playing' && (
+              {gameStatus === 'playing' && !blockchainGameEnded && (
                 <p>
                   Obecnie gra: 
                   {currentPlayerIndex === playerIndex
@@ -1081,7 +1096,7 @@ function GameRoom({ roomId, onBack }) {
                 </p>
               )}
               
-              {gameStatus === 'ended' && (
+              {(gameStatus === 'ended' || winner) && (
                 <p>
                   Zwycięzca: 
                   {winner === publicKey?.toString()
@@ -1100,7 +1115,7 @@ function GameRoom({ roomId, onBack }) {
           </div>
           
           {/* Informacja o zwycięzcy */}
-          {gameStatus === 'ended' && (
+          {(gameStatus === 'ended' || winner) && (
             <div className="winner-announcement">
               <h3>Gra zakończona!</h3>
               <p>
@@ -1108,29 +1123,10 @@ function GameRoom({ roomId, onBack }) {
                   ? 'Gratulacje! Wygrałeś grę!'
                   : `Gracz ${roomInfo?.players.indexOf(winner) + 1} wygrał grę.`}
               </p>
-              
-              {/* Przycisk do ręcznego zakończenia gry na blockchain */}
-              {!roomInfo?.winner && playerIndex >= 0 && (
-                <div style={{ marginTop: '20px' }}>
-                  <p style={{ fontSize: '14px', color: '#7f8c8d' }}>
-                    Gra wymaga potwierdzenia na blockchain
-                  </p>
-                  <button
-                    onClick={() => handleEndGame(winner)}
-                    disabled={isEndingGame || isLoading}
-                    style={{
-                      backgroundColor: '#f39c12',
-                      color: 'white',
-                      border: 'none',
-                      padding: '10px 20px',
-                      borderRadius: '5px',
-                      cursor: isEndingGame ? 'not-allowed' : 'pointer',
-                      marginTop: '10px'
-                    }}
-                  >
-                    {isEndingGame ? 'Potwierdzanie...' : 'Potwierdź zakończenie gry'}
-                  </button>
-                </div>
+              {winner === publicKey?.toString() && !blockchainGameEnded && (
+                <p style={{ marginTop: '10px', fontSize: '14px', color: '#e74c3c' }}>
+                  Oczekiwanie na potwierdzenie blockchain...
+                </p>
               )}
             </div>
           )}
@@ -1160,9 +1156,9 @@ function GameRoom({ roomId, onBack }) {
             {/* Talia */}
             <div 
               className="deck" 
-              onClick={currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' ? handleDrawCard : undefined}
+              onClick={currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' && !blockchainGameEnded ? handleDrawCard : undefined}
               style={{ 
-                cursor: currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' 
+                cursor: currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' && !blockchainGameEnded
                   ? 'pointer' 
                   : 'default' 
               }}
@@ -1191,7 +1187,7 @@ function GameRoom({ roomId, onBack }) {
           {/* Ręka gracza */}
           <div className="player-info">
             <p>Twoje karty ({playerHand?.length || 0})</p>
-            {currentPlayerIndex === playerIndex && gameStatus === 'playing' && (
+            {currentPlayerIndex === playerIndex && gameStatus === 'playing' && !blockchainGameEnded && (
               <>
                 <p className="your-turn">Twoja kolej! <span className="timer">{turnTimer}s</span></p>
                 {turnTimer <= 10 && (
@@ -1221,7 +1217,8 @@ function GameRoom({ roomId, onBack }) {
             
             {gameStatus === 'playing' &&
               currentPlayerIndex === playerIndex && 
-              connectionStatus === 'connected' && (
+              connectionStatus === 'connected' &&
+              !blockchainGameEnded && (
                 <button 
                   className="draw-card-btn" 
                   onClick={handleDrawCard}
@@ -1232,82 +1229,44 @@ function GameRoom({ roomId, onBack }) {
               )}
               
             {gameStatus === 'ended' &&
+              blockchainGameEnded &&
               winner === publicKey?.toString() && (
-                <>
-                  {/* Debug info */}
-                  <div style={{ 
-                    backgroundColor: '#f0f0f0', 
-                    padding: '10px', 
-                    borderRadius: '5px', 
-                    marginTop: '20px',
-                    fontSize: '12px'
-                  }}>
-                    <h4>Debug Info:</h4>
-                    <p>Game Status: {gameStatus}</p>
-                    <p>Winner (local): {winner || 'none'}</p>
-                    <p>Winner (roomInfo): {roomInfo?.winner || 'none'}</p>
-                    <p>Room Address: {roomInfo?.roomAddress}</p>
-                    <p>Is Active: {roomInfo?.isActive ? 'true' : 'false'}</p>
-                    <button
-                      onClick={async () => {
-                        try {
-                          console.log("Checking blockchain state...");
-                          const { Connection, PublicKey } = await import('@solana/web3.js');
-                          const connection = new Connection(
-                            process.env.REACT_APP_SOLANA_RPC_URL || 'https://api.devnet.solana.com',
-                            'confirmed'
-                          );
-                          
-                          const roomPDA = new PublicKey(roomInfo.roomAddress);
-                          const accountInfo = await connection.getAccountInfo(roomPDA);
-                          
-                          if (accountInfo) {
-                            console.log("Account info:", {
-                              lamports: accountInfo.lamports,
-                              owner: accountInfo.owner.toString(),
-                              dataLength: accountInfo.data.length,
-                              data: Array.from(accountInfo.data.slice(0, 100)) // First 100 bytes
-                            });
-                            
-                            // Try to parse the data
-                            const dataView = accountInfo.data;
-                            const headerSize = dataView.readUInt32LE(0);
-                            console.log("Header size:", headerSize);
-                            
-                            // Read status byte (should be at specific offset)
-                            // This is approximate - you need to calculate exact offset
-                            const statusOffset = 4 + 32 + 1 + 8 + 4; // header + creator + max_players + fee + vec length
-                            console.log("Data at status offset:", Array.from(dataView.slice(statusOffset, statusOffset + 50)));
-                          } else {
-                            console.log("No account found at address");
-                          }
-                        } catch (error) {
-                          console.error("Error checking blockchain:", error);
-                        }
-                      }}
-                      style={{
-                        backgroundColor: '#3498db',
-                        color: 'white',
-                        border: 'none',
-                        padding: '5px 10px',
-                        borderRadius: '3px',
-                        cursor: 'pointer',
-                        marginTop: '5px'
-                      }}
-                    >
-                      Check Blockchain State
-                    </button>
-                  </div>
-                  
-                  <button
-                    className="claim-prize-btn"
-                    onClick={handleClaimPrize}
-                    disabled={isLoading}
-                  >
-                    {isLoading ? 'Odbieranie...' : `Odbierz nagrodę (${roomInfo?.entryFee * roomInfo?.currentPlayers} SOL)`}
-                  </button>
-                </>
+                <button
+                  className="claim-prize-btn"
+                  onClick={handleClaimPrize}
+                  disabled={isLoading}
+                >
+                  {isLoading ? 'Odbieranie...' : `Odbierz nagrodę (${roomInfo?.entryFee * roomInfo?.currentPlayers} SOL)`}
+                </button>
               )}
+              
+            {/* Przycisk ręcznego zakończenia gry jeśli coś poszło nie tak */}
+            {winner === publicKey?.toString() && !blockchainGameEnded && (
+              <button
+                className="end-game-btn"
+                onClick={async () => {
+                  try {
+                    setIsLoading(true);
+                    setError(null);
+                    await endGame(roomId, publicKey.toString(), wallet);
+                    setBlockchainGameEnded(true);
+                    await loadRoomAndGameInfo(true);
+                  } catch (error) {
+                    console.error("Error ending game manually:", error);
+                    setError(`Błąd podczas kończenia gry: ${error.message}`);
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                disabled={isLoading}
+                style={{
+                  backgroundColor: '#f39c12',
+                  color: 'white'
+                }}
+              >
+                {isLoading ? 'Kończenie gry...' : 'Zakończ grę na blockchainie'}
+              </button>
+            )}
           </div>
           
           <button 

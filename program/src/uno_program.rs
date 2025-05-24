@@ -537,6 +537,9 @@ fn process_end_game(
 }
 
 /// Implementacja odbierania nagrody
+// Zamień funkcję process_claim_prize na:
+
+/// Implementacja odbierania nagrody
 fn process_claim_prize(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -545,7 +548,7 @@ fn process_claim_prize(
     
     let winner_account = next_account_info(accounts_iter)?;
     let game_account = next_account_info(accounts_iter)?;
-    let system_program = next_account_info(accounts_iter)?;
+    let _system_program = next_account_info(accounts_iter)?; // Nie używamy, ale zachowujemy dla kompatybilności
     
     msg!("Claim prize - Winner account: {}", winner_account.key);
     msg!("Claim prize - Game account: {}", game_account.key);
@@ -554,6 +557,12 @@ fn process_claim_prize(
     if !winner_account.is_signer {
         msg!("Error: Winner account is not a signer");
         return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    // Sprawdź czy game_account należy do naszego programu
+    if game_account.owner != program_id {
+        msg!("Error: Game account is not owned by this program");
+        return Err(ProgramError::IncorrectProgramId);
     }
     
     // Wczytanie danych pokoju
@@ -586,26 +595,19 @@ fn process_claim_prize(
     let prize = game_room.entry_fee_lamports * game_room.players.len() as u64;
     msg!("Prize amount: {} lamports", prize);
     
-    // Przelew nagrody
-    let seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot]];
-    let (_, bump_seed) = Pubkey::find_program_address(seeds, program_id);
-    let signer_seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot], &[bump_seed]];
+    // Sprawdź czy konto ma wystarczające środki
+    let game_account_lamports = game_account.lamports();
+    if game_account_lamports < prize {
+        msg!("Error: Insufficient funds in game account. Has: {}, needs: {}", 
+            game_account_lamports, prize);
+        return Err(ProgramError::InsufficientFunds);
+    }
     
-    msg!("Transferring prize to winner");
+    msg!("Transferring prize to winner using direct lamport transfer");
     
-    invoke_signed(
-        &system_instruction::transfer(
-            game_account.key,
-            winner_account.key,
-            prize,
-        ),
-        &[
-            game_account.clone(),
-            winner_account.clone(),
-            system_program.clone(),
-        ],
-        &[signer_seeds],
-    )?;
+    // Bezpośredni transfer lamportów (zamiast system_instruction::transfer)
+    **game_account.try_borrow_mut_lamports()? -= prize;
+    **winner_account.try_borrow_mut_lamports()? += prize;
     
     msg!("Prize transferred successfully");
     

@@ -94,9 +94,10 @@ async function verifyTransaction(signature) {
 }
 
 // Znajdź adres PDA dla pokoju gry
-async function findGamePDA(creatorPubkey) {
+async function findGamePDA(creatorPubkey, roomSlot = 0) {
+  // Uwzględnij slot pokoju w PDA
   return await PublicKey.findProgramAddress(
-    [Buffer.from('uno_game'), creatorPubkey.toBuffer()],
+    [Buffer.from('uno_game'), creatorPubkey.toBuffer(), Buffer.from([roomSlot])],
     PROGRAM_ID
   );
 }
@@ -131,10 +132,12 @@ app.set("solanaConnection", connection);
 app.set("solanaProgram", PROGRAM_ID);
 app.set("gameStates", gameStates);
 app.set("activeRooms", activeRooms);
+app.set("gameStateSubscriptions", gameStateSubscriptions);
 app.set("verifyTransaction", verifyTransaction);
 app.set("findGamePDA", findGamePDA);
 app.set("getRoomStateFromChain", getRoomStateFromChain);
 app.set("socketIo", io);
+app.set("serverKeyPair", serverKeyPair); // Udostępnij klucz serwera jeśli istnieje
 
 // Ustawienie tras
 app.use('/api', routes);
@@ -304,7 +307,7 @@ io.on('connection', (socket) => {
       // Wyślij aktualizację stanu gry do wszystkich graczy
       broadcastGameState(roomId, game);
       
-      // Jeśli ktoś wygrał, aktualizuj dane pokoju
+      // Jeśli ktoś wygrał, aktualizuj dane pokoju i zakończ grę
       if (result.winner) {
         const room = activeRooms.get(roomId);
         if (room) {
@@ -313,11 +316,38 @@ io.on('connection', (socket) => {
           room.endedAt = new Date().toISOString();
           room.lastActivity = new Date().toISOString();
           
-          // Powiadom wszystkich o zakończeniu gry
-          io.to(roomId).emit('game_ended', { winner: playerAddress });
+          // Znajdź socket ID zwycięzcy
+          const winnerSubscriptionKey = `${roomId}-${playerAddress}`;
+          const winnerSocketId = gameStateSubscriptions.get(winnerSubscriptionKey);
+          
+          // Powiadom zwycięzcę, że musi wywołać endGame na blockchainie
+          if (winnerSocketId) {
+            io.to(winnerSocketId).emit('must_end_game_on_chain', {
+              roomId,
+              winnerAddress: playerAddress,
+              message: "You won! Please confirm the game end on blockchain."
+            });
+          }
+          
+          // Powiadom wszystkich o oczekiwaniu na blockchain
+          io.to(roomId).emit('game_ending', { 
+            winner: playerAddress,
+            waitingForBlockchain: true 
+          });
           
           // Aktualizuj dane w pamięci
           activeRooms.set(roomId, room);
+          
+          // Ustaw timeout - jeśli po 30 sekundach gra nie została zakończona na blockchainie
+          setTimeout(() => {
+            const currentRoom = activeRooms.get(roomId);
+            if (currentRoom && !currentRoom.blockchainEnded) {
+              console.warn(`Game ${roomId} not ended on blockchain after 30s`);
+              io.to(roomId).emit('blockchain_timeout', {
+                message: "Game end confirmation timeout. You can try claiming prize manually."
+              });
+            }
+          }, 30000);
         }
       }
     } catch (error) {
