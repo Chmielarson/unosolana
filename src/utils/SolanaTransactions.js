@@ -55,9 +55,9 @@ Porządek bajtów: little-endian dla liczb, UTF-8 dla stringów
 */
 
 // Serializacja instrukcji CreateRoom
-function serializeCreateRoomData(maxPlayers, entryFee) {
-  // Tworzymy bufor odpowiedniej wielkości: 1 + 1 + 8 = 10 bajtów
-  const buffer = Buffer.alloc(10);
+function serializeCreateRoomData(maxPlayers, entryFee, roomSlot = 0) {
+  // Tworzymy bufor odpowiedniej wielkości: 1 + 1 + 8 + 1 = 11 bajtów
+  const buffer = Buffer.alloc(11);
   
   // Instrukcja CreateRoom (0)
   buffer.writeUInt8(0, 0);
@@ -77,10 +77,14 @@ function serializeCreateRoomData(maxPlayers, entryFee) {
   // Używamy Buffer.writeBigUInt64LE na pozycji 2
   buffer.writeBigUInt64LE(BigInt(entryFeeLamports), 2);
   
+  // room_slot: u8
+  buffer.writeUInt8(roomSlot, 10);
+  
   console.log("Serialized CreateRoom data:", {
     instruction: buffer[0],
     maxPlayers: buffer[1], 
     entryFeeLamports: entryFeeLamports,
+    roomSlot: buffer[10],
     bufferLength: buffer.length,
     buffer: Array.from(buffer)
   });
@@ -167,12 +171,43 @@ function serializeCancelRoomData() {
 
 // ========== FUNKCJE POMOCNICZE ==========
 
-// Znajdź adres PDA dla pokoju gry
-async function findGamePDA(creatorPubkey) {
+// Znajdź adres PDA dla pokoju gry z numerem
+async function findGamePDA(creatorPubkey, roomNumber = 0) {
+  // Dodajemy numer pokoju do seeda, aby umożliwić tworzenie wielu pokojów
   return await PublicKey.findProgramAddress(
-    [Buffer.from('uno_game'), creatorPubkey.toBuffer()],
+    [
+      Buffer.from('uno_game'), 
+      creatorPubkey.toBuffer(),
+      Buffer.from([roomNumber]) // Dodajemy numer pokoju jako dodatkowy seed
+    ],
     PROGRAM_ID
   );
+}
+
+// Sprawdź czy PDA już istnieje
+async function checkPDAExists(pdaAddress) {
+  try {
+    const accountInfo = await connection.getAccountInfo(pdaAddress);
+    return accountInfo !== null;
+  } catch (error) {
+    console.error('Error checking PDA existence:', error);
+    return false;
+  }
+}
+
+// Znajdź pierwszy wolny slot dla pokoju
+async function findAvailableRoomSlot(creatorPubkey) {
+  for (let i = 0; i < 10; i++) { // Sprawdź maksymalnie 10 slotów
+    const [pda] = await findGamePDA(creatorPubkey, i);
+    const exists = await checkPDAExists(pda);
+    
+    if (!exists) {
+      console.log(`Found available room slot: ${i}`);
+      return { slot: i, pda };
+    }
+  }
+  
+  throw new Error('Brak dostępnych slotów na nowy pokój. Maksymalna liczba pokojów została osiągnięta.');
 }
 
 // Inicjalizacja i zarządzanie Socket.IO
@@ -380,17 +415,25 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
   });
 
   try {
-    // Znajdź adres PDA dla pokoju
-    const [gamePDA, bump] = await findGamePDA(publicKey);
-    console.log("Game PDA found:", {
-      address: gamePDA.toString(),
-      bump,
-      creator: publicKey.toString(),
-      programId: PROGRAM_ID.toString()
-    });
+    // Sprawdź czy użytkownik ma już aktywny pokój
+    const existingRooms = await getRooms();
+    const userActiveRoom = existingRooms.find(room => 
+      room.creatorAddress === publicKey.toString() && 
+      room.isActive !== false
+    );
+    
+    if (userActiveRoom) {
+      throw new Error('Masz już aktywny pokój. Zakończ lub anuluj poprzedni pokój przed utworzeniem nowego.');
+    }
+    
+    // Znajdź wolny slot dla nowego pokoju
+    const { slot, pda: gamePDA } = await findAvailableRoomSlot(publicKey);
+    
+    console.log("Creating room in slot:", slot);
+    console.log("Game PDA:", gamePDA.toString());
     
     // Serializuj dane instrukcji
-    const data = serializeCreateRoomData(maxPlayers, entryFee);
+    const data = serializeCreateRoomData(maxPlayers, entryFee, slot);
     
     // Utwórz instrukcję
     const instruction = new TransactionInstruction({
@@ -473,6 +516,7 @@ export async function createRoom(maxPlayers, entryFee, wallet) {
         maxPlayers,
         entryFee,
         roomAddress: gamePDA.toString(),
+        roomSlot: slot,
         transactionSignature: signature
       }),
     });
@@ -771,7 +815,9 @@ export async function startGame(roomId, wallet) {
 
 // Funkcja kończąca grę on-chain
 export async function endGame(roomId, winnerAddress, wallet) {
-  console.log("Ending game:", { roomId, winnerAddress });
+  console.log("=== ENDING GAME ===");
+  console.log("Room ID:", roomId);
+  console.log("Winner Address:", winnerAddress);
   
   const { publicKey, signTransaction } = wallet;
   
@@ -781,21 +827,33 @@ export async function endGame(roomId, winnerAddress, wallet) {
   
   try {
     // 1. Pobierz dane pokoju z serwera
+    console.log("1. Fetching room data from server...");
     const roomData = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' }
     });
     
-    console.log("Room data for ending game:", roomData);
+    console.log("Room data received:", {
+      roomAddress: roomData.roomAddress,
+      winner: roomData.winner,
+      gameStarted: roomData.gameStarted,
+      players: roomData.players
+    });
+    
+    // NIE sprawdzaj czy gra ma już zwycięzcę w bazie - zawsze wykonaj transakcję blockchain
     
     // 2. Pobierz adres PDA pokoju
     const roomPDA = new PublicKey(roomData.roomAddress);
+    console.log("Room PDA:", roomPDA.toString());
     
     // 3. Utwórz PublicKey dla zwycięzcy
     const winnerPubkey = new PublicKey(winnerAddress);
+    console.log("Winner Pubkey:", winnerPubkey.toString());
     
     // 4. Serializuj dane instrukcji
+    console.log("4. Serializing EndGame instruction...");
     const data = serializeEndGameData(winnerPubkey);
+    console.log("Serialized data length:", data.length);
     
     // 5. Utwórz instrukcję
     const instruction = new TransactionInstruction({
@@ -807,35 +865,54 @@ export async function endGame(roomId, winnerAddress, wallet) {
       data: data
     });
     
+    console.log("5. Instruction created");
+    
     // 6. Utwórz transakcję
     const transaction = new Transaction().add(instruction);
     
     // 7. Pobierz ostatni blok
+    console.log("7. Getting latest blockhash...");
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = publicKey;
     
     // 8. Podpisz transakcję
+    console.log("8. Requesting signature from wallet...");
     let signedTransaction;
     try {
       signedTransaction = await signTransaction(transaction);
+      console.log("Transaction signed successfully");
     } catch (signError) {
+      console.error("Error signing transaction:", signError);
       throw new Error(`Błąd podpisu: ${signError.message}`);
     }
     
     // 9. Wyślij transakcję
-    const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+    console.log("9. Sending transaction...");
+    const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+    
+    console.log("Transaction sent, signature:", signature);
     
     // 10. Poczekaj na potwierdzenie
-    await connection.confirmTransaction({
+    console.log("10. Waiting for confirmation...");
+    const confirmation = await connection.confirmTransaction({
       blockhash,
       lastValidBlockHeight,
       signature
     }, 'confirmed');
     
-    console.log("End game transaction confirmed:", signature);
+    if (confirmation.value.err) {
+      console.error("Transaction failed:", confirmation.value.err);
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+    
+    console.log("✅ End game transaction confirmed:", signature);
     
     // 11. Powiadom serwer o zakończeniu gry
+    console.log("11. Notifying server...");
     const endResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/end`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -845,10 +922,27 @@ export async function endGame(roomId, winnerAddress, wallet) {
       }),
     });
     
-    console.log("Game ended successfully:", endResult);
+    console.log("✅ Game ended successfully:", endResult);
     return endResult;
   } catch (error) {
-    console.error('Error ending game:', error);
+    console.error('❌ Error ending game:', error);
+    
+    // Jeśli to błąd że gra już zakończona na blockchain, to OK
+    if (error.message && error.message.includes('InvalidAccountData')) {
+      console.log("Game might already be ended on blockchain");
+      return { alreadyEnded: true };
+    }
+    
+    // Jeśli to błąd SendTransaction, spróbuj uzyskać dodatkowe informacje
+    if (error.name === 'SendTransactionError') {
+      try {
+        const logs = await error.getLogs();
+        console.error('Transaction logs:', logs);
+      } catch (logError) {
+        console.error('Could not get transaction logs:', logError);
+      }
+    }
+    
     throw error;
   }
 }
@@ -1402,10 +1496,10 @@ export function testSerialization() {
   try {
     // Test CreateRoom
     console.log("1. Testing CreateRoom serialization...");
-    const createRoomData = serializeCreateRoomData(2, 0.1);
+    const createRoomData = serializeCreateRoomData(2, 0.1, 0);
     console.log("✓ CreateRoom serialization successful");
     console.log("  Data length:", createRoomData.length);
-    console.log("  Expected: 10 bytes (1 + 1 + 8)");
+    console.log("  Expected: 11 bytes (1 + 1 + 8 + 1)");
     
     // Test JoinRoom
     console.log("2. Testing JoinRoom serialization...");

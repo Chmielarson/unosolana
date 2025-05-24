@@ -10,7 +10,6 @@ use solana_program::{
     program::{invoke, invoke_signed},
     system_instruction,
     sysvar::{rent::Rent, Sysvar, clock::Clock},
-    clock::UnixTimestamp,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -36,10 +35,14 @@ pub struct GameRoom {
     pub game_ended_at: Option<i64>,       // 1 + 8 = 9 bajtów
     pub prize_claimed: bool,              // 1 bajt
     pub game_id: [u8; 64],               // 64 bajty - stały rozmiar zamiast String
+    pub room_slot: u8,                   // 1 bajt - numer slotu pokoju
 }
 
 impl GameRoom {
-    pub fn new(creator: Pubkey, max_players: u8, entry_fee_lamports: u64, created_at: i64) -> Self {
+    pub const SIZE: usize = 512;
+    pub const HEADER_SIZE: usize = 4; // Pierwsze 4 bajty przechowują rozmiar danych
+    
+    pub fn new(creator: Pubkey, max_players: u8, entry_fee_lamports: u64, created_at: i64, room_slot: u8) -> Self {
         Self {
             creator,
             max_players,
@@ -51,8 +54,72 @@ impl GameRoom {
             game_started_at: None,
             game_ended_at: None,
             prize_claimed: false,
-            game_id: [0u8; 64], // Inicjalizacja pustą tablicą
+            game_id: [0u8; 64],
+            room_slot,
         }
+    }
+    
+    // Metoda do bezpiecznej deserializacji
+    pub fn from_account_data(data: &[u8]) -> Result<Self, ProgramError> {
+        // Sprawdzamy czy dane mają minimalny rozmiar
+        if data.len() < Self::HEADER_SIZE {
+            msg!("Account data too small for header");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        
+        // Odczytaj rozmiar danych z pierwszych 4 bajtów
+        let size_bytes: [u8; 4] = data[..4].try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let data_size = u32::from_le_bytes(size_bytes) as usize;
+        
+        msg!("Data size from header: {}", data_size);
+        
+        // Sprawdź czy mamy wystarczająco danych
+        if data.len() < Self::HEADER_SIZE + data_size {
+            msg!("Not enough data. Expected: {}, got: {}", Self::HEADER_SIZE + data_size, data.len());
+            return Err(ProgramError::InvalidAccountData);
+        }
+        
+        // Deserializuj dane pomijając nagłówek
+        Self::try_from_slice(&data[Self::HEADER_SIZE..Self::HEADER_SIZE + data_size])
+            .map_err(|e| {
+                msg!("Deserialization error: {:?}", e);
+                ProgramError::InvalidAccountData
+            })
+    }
+    
+    // Metoda do bezpiecznej serializacji
+    pub fn to_account_data(&self, data: &mut [u8]) -> Result<(), ProgramError> {
+        // Sprawdzamy czy mamy wystarczająco miejsca
+        if data.len() < Self::SIZE {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        
+        // Najpierw wyczyść cały bufor
+        for byte in data.iter_mut() {
+            *byte = 0;
+        }
+        
+        // Serializuj do tymczasowego bufora
+        let mut temp_buffer = Vec::new();
+        self.serialize(&mut temp_buffer)?;
+        
+        let data_size = temp_buffer.len();
+        msg!("Serialized data size: {}", data_size);
+        
+        // Sprawdź czy zmieści się w buforze
+        if data_size + Self::HEADER_SIZE > data.len() {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        
+        // Zapisz rozmiar danych w pierwszych 4 bajtach
+        let size_bytes = (data_size as u32).to_le_bytes();
+        data[..4].copy_from_slice(&size_bytes);
+        
+        // Zapisz dane po nagłówku
+        data[Self::HEADER_SIZE..Self::HEADER_SIZE + data_size].copy_from_slice(&temp_buffer);
+        
+        Ok(())
     }
     
     // Dodajemy metodę pomocniczą do ustawiania game_id
@@ -81,6 +148,7 @@ pub enum UnoInstruction {
     CreateRoom {
         max_players: u8,
         entry_fee_lamports: u64,
+        room_slot: u8,  // Dodajemy slot pokoju
     },
     
     /// Dołącza do istniejącego pokoju
@@ -146,23 +214,28 @@ pub fn process_instruction(
     let instruction = UnoInstruction::try_from_slice(input)?;
     
     match instruction {
-        UnoInstruction::CreateRoom { max_players, entry_fee_lamports } => {
-            msg!("Processing CreateRoom: max_players={}, entry_fee={}", max_players, entry_fee_lamports);
-            process_create_room(program_id, accounts, max_players, entry_fee_lamports)
+        UnoInstruction::CreateRoom { max_players, entry_fee_lamports, room_slot } => {
+            msg!("Processing CreateRoom: max_players={}, entry_fee={}, slot={}", max_players, entry_fee_lamports, room_slot);
+            process_create_room(program_id, accounts, max_players, entry_fee_lamports, room_slot)
         },
         UnoInstruction::JoinRoom => {
+            msg!("Processing JoinRoom");
             process_join_room(program_id, accounts)
         },
         UnoInstruction::StartGame { game_id } => {
+            msg!("Processing StartGame with id: {}", game_id);
             process_start_game(program_id, accounts, game_id)
         },
         UnoInstruction::EndGame { winner } => {
+            msg!("Processing EndGame with winner: {}", winner);
             process_end_game(program_id, accounts, winner)
         },
         UnoInstruction::ClaimPrize => {
+            msg!("Processing ClaimPrize");
             process_claim_prize(program_id, accounts)
         },
         UnoInstruction::CancelRoom => {
+            msg!("Processing CancelRoom");
             process_cancel_room(program_id, accounts)
         },
     }
@@ -174,8 +247,9 @@ fn process_create_room(
     accounts: &[AccountInfo],
     max_players: u8,
     entry_fee_lamports: u64,
+    room_slot: u8,
 ) -> ProgramResult {
-    msg!("Starting create_room with max_players: {}, entry_fee: {}", max_players, entry_fee_lamports);
+    msg!("Starting create_room with max_players: {}, entry_fee: {}, slot: {}", max_players, entry_fee_lamports, room_slot);
     
     let accounts_iter = &mut accounts.iter();
     
@@ -211,19 +285,26 @@ fn process_create_room(
         return Err(ProgramError::InvalidArgument);
     }
     
-    // Weryfikacja czy konto pokoju jest prawidłowym PDA
+    // Walidacja slotu (maksymalnie 10 pokojów na użytkownika)
+    if room_slot >= 10 {
+        msg!("Error: Invalid room slot: {}", room_slot);
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    // Weryfikacja czy konto pokoju jest prawidłowym PDA z uwzględnieniem slotu
     let (expected_game_pubkey, bump_seed) = Pubkey::find_program_address(
-        &[b"uno_game", creator_account.key.as_ref()],
+        &[b"uno_game", creator_account.key.as_ref(), &[room_slot]],
         program_id,
     );
     
     if expected_game_pubkey != *game_account.key {
+        msg!("Error: Invalid PDA. Expected: {}, Got: {}", expected_game_pubkey, game_account.key);
         return Err(ProgramError::InvalidArgument);
     }
     
     // Obliczenie czynszu
     let rent = Rent::from_account_info(rent_account)?;
-    let space = 512; // Zwiększony rozmiar dla bezpieczeństwa
+    let space = GameRoom::SIZE;
     let lamports = rent.minimum_balance(space);
     
     // Utworzenie konta PDA
@@ -240,7 +321,7 @@ fn process_create_room(
             game_account.clone(),
             system_program.clone(),
         ],
-        &[&[b"uno_game", creator_account.key.as_ref(), &[bump_seed]]],
+        &[&[b"uno_game", creator_account.key.as_ref(), &[room_slot], &[bump_seed]]],
     )?;
     
     // Transfer wpisowego
@@ -258,7 +339,6 @@ fn process_create_room(
     )?;
     
     // Inicjalizacja danych pokoju
-    // Użyj Clock sysvar zamiast std::time
     let clock = Clock::get()?;
     let current_timestamp = clock.unix_timestamp;
     
@@ -267,18 +347,19 @@ fn process_create_room(
         max_players,
         entry_fee_lamports,
         current_timestamp,
+        room_slot,
     );
     
     // Serializacja i zapisanie danych
-    game_room.serialize(&mut *game_account.data.borrow_mut())?;
+    game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
-    msg!("Utworzono nowy pokój gry UNO");
+    msg!("Utworzono nowy pokój gry UNO w slocie {}", room_slot);
     Ok(())
 }
 
 /// Implementacja dołączania do pokoju
 fn process_join_room(
-    _program_id: &Pubkey,  // Dodano podkreślenie
+    _program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
@@ -287,8 +368,12 @@ fn process_join_room(
     let game_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
     
+    msg!("Join room - Player: {}", player_account.key);
+    msg!("Join room - Game account: {}", game_account.key);
+    
     // Weryfikacja podpisu
     if !player_account.is_signer {
+        msg!("Error: Missing required signature");
         return Err(ProgramError::MissingRequiredSignature);
     }
     
@@ -296,28 +381,31 @@ fn process_join_room(
     msg!("Game account data length: {}", game_account.data_len());
     
     // Wczytanie danych pokoju
-    let mut game_room = match GameRoom::try_from_slice(&game_account.data.borrow()) {
-        Ok(room) => room,
-        Err(e) => {
-            msg!("Failed to deserialize game room: {:?}", e);
-            return Err(ProgramError::InvalidAccountData);
-        }
-    };
+    let mut game_room = GameRoom::from_account_data(&game_account.data.borrow())?;
+    
+    msg!("Game room loaded successfully");
+    msg!("Current players: {:?}", game_room.players);
+    msg!("Entry fee: {}", game_room.entry_fee_lamports);
     
     // Sprawdzenie stanu pokoju
     if game_room.status != GameStatus::WaitingForPlayers {
+        msg!("Error: Room is not waiting for players");
         return Err(ProgramError::InvalidAccountData);
     }
     
     // Sprawdzenie czy gracz już jest w pokoju
     if game_room.players.contains(player_account.key) {
+        msg!("Error: Player already in room");
         return Err(ProgramError::InvalidArgument);
     }
     
     // Sprawdzenie czy pokój nie jest już pełny
     if game_room.players.len() >= game_room.max_players as usize {
+        msg!("Error: Room is full");
         return Err(ProgramError::InvalidArgument);
     }
+    
+    msg!("Transferring entry fee: {} lamports", game_room.entry_fee_lamports);
     
     // Transfer wpisowego
     invoke(
@@ -333,11 +421,15 @@ fn process_join_room(
         ],
     )?;
     
+    msg!("Entry fee transferred successfully");
+    
     // Dodanie gracza do listy
     game_room.players.push(*player_account.key);
     
+    msg!("Player added to room. Total players: {}", game_room.players.len());
+    
     // Zapisanie zaktualizowanych danych
-    game_room.serialize(&mut *game_account.data.borrow_mut())?;
+    game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
     msg!("Dołączono do pokoju gry UNO");
     Ok(())
@@ -360,7 +452,7 @@ fn process_start_game(
     }
     
     // Wczytanie danych pokoju
-    let mut game_room = GameRoom::try_from_slice(&game_account.data.borrow())?;
+    let mut game_room = GameRoom::from_account_data(&game_account.data.borrow())?;
     
     // Sprawdzenie czy osoba inicjująca jest w pokoju
     if !game_room.players.contains(initiator_account.key) {
@@ -386,7 +478,7 @@ fn process_start_game(
     game_room.game_started_at = Some(clock.unix_timestamp);
     
     // Zapisanie zaktualizowanych danych
-    game_room.serialize(&mut *game_account.data.borrow_mut())?;
+    game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
     msg!("Gra UNO rozpoczęta. Off-chain ID: {}", game_room.get_game_id());
     Ok(())
@@ -394,7 +486,7 @@ fn process_start_game(
 
 /// Implementacja zakończenia gry
 fn process_end_game(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,
     accounts: &[AccountInfo],
     winner: Pubkey,
 ) -> ProgramResult {
@@ -409,7 +501,7 @@ fn process_end_game(
     }
     
     // Wczytanie danych pokoju
-    let mut game_room = GameRoom::try_from_slice(&game_account.data.borrow())?;
+    let mut game_room = GameRoom::from_account_data(&game_account.data.borrow())?;
     
     // Sprawdzenie czy osoba inicjująca jest w pokoju lub jest twórcą
     let is_player = game_room.players.contains(initiator_account.key);
@@ -438,7 +530,7 @@ fn process_end_game(
     game_room.game_ended_at = Some(clock.unix_timestamp);
     
     // Zapisanie zaktualizowanych danych
-    game_room.serialize(&mut *game_account.data.borrow_mut())?;
+    game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
     msg!("Gra UNO zakończona. Zwycięzca: {}", winner);
     Ok(())
@@ -455,36 +547,51 @@ fn process_claim_prize(
     let game_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
     
+    msg!("Claim prize - Winner account: {}", winner_account.key);
+    msg!("Claim prize - Game account: {}", game_account.key);
+    
     // Weryfikacja podpisu
     if !winner_account.is_signer {
+        msg!("Error: Winner account is not a signer");
         return Err(ProgramError::MissingRequiredSignature);
     }
     
     // Wczytanie danych pokoju
-    let mut game_room = GameRoom::try_from_slice(&game_account.data.borrow())?;
+    let mut game_room = GameRoom::from_account_data(&game_account.data.borrow())?;
+    
+    msg!("Game room loaded. Status: {:?}", game_room.status);
+    msg!("Winner in game room: {:?}", game_room.winner);
+    msg!("Prize already claimed: {}", game_room.prize_claimed);
     
     // Sprawdzenie stanu gry
     if game_room.status != GameStatus::Completed {
+        msg!("Error: Game is not completed. Current status: {:?}", game_room.status);
         return Err(ProgramError::InvalidAccountData);
     }
     
     // Sprawdzenie czy gracz jest zwycięzcą
     if game_room.winner != Some(*winner_account.key) {
+        msg!("Error: Claimer is not the winner. Winner: {:?}, Claimer: {}", 
+            game_room.winner, winner_account.key);
         return Err(ProgramError::InvalidArgument);
     }
     
     // Sprawdzenie czy nagroda nie została już odebrana
     if game_room.prize_claimed {
+        msg!("Error: Prize already claimed");
         return Err(ProgramError::InvalidAccountData);
     }
     
     // Obliczenie nagrody (suma wszystkich wpisowych)
     let prize = game_room.entry_fee_lamports * game_room.players.len() as u64;
+    msg!("Prize amount: {} lamports", prize);
     
     // Przelew nagrody
-    let seeds = &[b"uno_game", game_room.creator.as_ref()];
+    let seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot]];
     let (_, bump_seed) = Pubkey::find_program_address(seeds, program_id);
-    let signer_seeds = &[b"uno_game", game_room.creator.as_ref(), &[bump_seed]];
+    let signer_seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot], &[bump_seed]];
+    
+    msg!("Transferring prize to winner");
     
     invoke_signed(
         &system_instruction::transfer(
@@ -500,11 +607,13 @@ fn process_claim_prize(
         &[signer_seeds],
     )?;
     
+    msg!("Prize transferred successfully");
+    
     // Oznaczenie nagrody jako odebranej
     game_room.prize_claimed = true;
     
     // Zapisanie zaktualizowanych danych
-    game_room.serialize(&mut *game_account.data.borrow_mut())?;
+    game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
     msg!("Nagroda odebrana: {} lamports", prize);
     Ok(())
@@ -512,7 +621,7 @@ fn process_claim_prize(
 
 /// Implementacja anulowania pokoju
 fn process_cancel_room(
-    program_id: &Pubkey,  // Poprawiono - usunięto podkreślenie (parametr jest używany)
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
@@ -527,7 +636,7 @@ fn process_cancel_room(
     }
     
     // Wczytanie danych pokoju
-    let game_room = GameRoom::try_from_slice(&game_account.data.borrow())?;
+    let game_room = GameRoom::from_account_data(&game_account.data.borrow())?;
     
     // Sprawdzenie czy osoba wywołująca jest twórcą
     if game_room.creator != *creator_account.key {
@@ -540,9 +649,9 @@ fn process_cancel_room(
     }
     
     // Przygotowanie sygnatury PDA
-    let seeds = &[b"uno_game", game_room.creator.as_ref()];
+    let seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot]];
     let (_, bump_seed) = Pubkey::find_program_address(seeds, program_id);
-    let signer_seeds = &[b"uno_game", game_room.creator.as_ref(), &[bump_seed]];
+    let signer_seeds = &[b"uno_game", game_room.creator.as_ref(), &[game_room.room_slot], &[bump_seed]];
     
     // Zwrot wpisowego każdemu graczowi
     let mut remaining_accounts_iter = accounts_iter.clone();
