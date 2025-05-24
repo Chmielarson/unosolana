@@ -537,8 +537,6 @@ fn process_end_game(
 }
 
 /// Implementacja odbierania nagrody
-// Zamień funkcję process_claim_prize na:
-
 /// Implementacja odbierania nagrody
 fn process_claim_prize(
     program_id: &Pubkey,
@@ -548,7 +546,7 @@ fn process_claim_prize(
     
     let winner_account = next_account_info(accounts_iter)?;
     let game_account = next_account_info(accounts_iter)?;
-    let _system_program = next_account_info(accounts_iter)?; // Nie używamy, ale zachowujemy dla kompatybilności
+    let _system_program = next_account_info(accounts_iter)?;
     
     msg!("Claim prize - Winner account: {}", winner_account.key);
     msg!("Claim prize - Game account: {}", game_account.key);
@@ -596,18 +594,39 @@ fn process_claim_prize(
     msg!("Prize amount: {} lamports", prize);
     
     // Sprawdź czy konto ma wystarczające środki
-    let game_account_lamports = game_account.lamports();
-    if game_account_lamports < prize {
-        msg!("Error: Insufficient funds in game account. Has: {}, needs: {}", 
-            game_account_lamports, prize);
+    let rent = Rent::get()?;
+    let rent_exempt_balance = rent.minimum_balance(game_account.data_len());
+    let available_balance = game_account.lamports().saturating_sub(rent_exempt_balance);
+    
+    msg!("Game account balance: {} lamports", game_account.lamports());
+    msg!("Rent exempt balance: {} lamports", rent_exempt_balance);
+    msg!("Available for prize: {} lamports", available_balance);
+    
+    if available_balance < prize {
+        msg!("Error: Insufficient funds in game account. Available: {}, needs: {}", 
+            available_balance, prize);
         return Err(ProgramError::InsufficientFunds);
     }
     
-    msg!("Transferring prize to winner using direct lamport transfer");
-    
-    // Bezpośredni transfer lamportów (zamiast system_instruction::transfer)
-    **game_account.try_borrow_mut_lamports()? -= prize;
-    **winner_account.try_borrow_mut_lamports()? += prize;
+    // Sprawdź, czy po transferze zostanie wystarczająco na rent
+    let remaining_balance = game_account.lamports().saturating_sub(prize);
+    if remaining_balance < rent_exempt_balance {
+        msg!("Error: Transfer would leave account below rent-exempt threshold");
+        // Transfer tylko dostępnej kwoty
+        let transferable_amount = available_balance;
+        msg!("Adjusting prize to maximum transferable amount: {} lamports", transferable_amount);
+        
+        // Bezpośredni transfer lamportów
+        **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(transferable_amount);
+        **winner_account.try_borrow_mut_lamports()? = winner_account.lamports().saturating_add(transferable_amount);
+    } else {
+        // Normalny transfer pełnej nagrody
+        msg!("Transferring full prize to winner");
+        
+        // Bezpośredni transfer lamportów
+        **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(prize);
+        **winner_account.try_borrow_mut_lamports()? = winner_account.lamports().saturating_add(prize);
+    }
     
     msg!("Prize transferred successfully");
     
@@ -617,7 +636,7 @@ fn process_claim_prize(
     // Zapisanie zaktualizowanych danych
     game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
-    msg!("Nagroda odebrana: {} lamports", prize);
+    msg!("Nagroda odebrana");
     Ok(())
 }
 
