@@ -16,7 +16,7 @@ const NETWORK = process.env.REACT_APP_SOLANA_NETWORK || 'devnet';
 const connection = new Connection(clusterApiUrl(NETWORK), 'confirmed');
 
 // Adres serwera gry - domyślnie localhost dla developmentu
-const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://localhost:3001';
+const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://172.104.242.167:3001';
 
 // Adres programu Solana (smart contract)
 const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'BD1JLkPHrmER2GUDvYM4c53BT7itW2VcPhXnhBQgHDCF');
