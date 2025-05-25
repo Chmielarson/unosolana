@@ -158,27 +158,31 @@ class UnoGame {
   }
 
   handleSpecialCardEffects(card) {
-    // Znajdź indeks aktualnego gracza (dla pewności)
-    const currentPlayerIndex = this.currentPlayerIndex;
+    // WAŻNA POPRAWKA: Najpierw przejdź do następnego gracza
+    let nextPlayerIndex = this.getNextPlayerIndex();
     
     switch (card.value) {
       case 'Skip':
-        // Pomiń następnego gracza
-        this.currentPlayerIndex = this.getNextPlayerIndex();
+        // Pomiń następnego gracza - przejdź o jeden dalej
+        this.currentPlayerIndex = this.getNextPlayerIndex(nextPlayerIndex);
         break;
+        
       case 'Reverse':
         // Zmień kierunek gry
         this.direction *= -1;
         
-        // Dla 2 graczy, działa jak Skip
+        // Dla 2 graczy, Reverse działa jak Skip
         if (this.players.length === 2) {
-          break;
+          this.currentPlayerIndex = this.getNextPlayerIndex();
+        } else {
+          // Dla 3+ graczy, po zmianie kierunku ustaw na następnego gracza
+          this.currentPlayerIndex = this.getNextPlayerIndex();
         }
         break;
+        
       case 'Draw2':
         // Następny gracz dobiera 2 karty
-        const nextPlayerDraw2Index = this.getNextPlayerIndex();
-        const nextPlayerDraw2 = this.players[nextPlayerDraw2Index];
+        const nextPlayerDraw2 = this.players[nextPlayerIndex];
         const nextPlayerDraw2Hand = this.playerHands[nextPlayerDraw2];
         
         // Dobierz 2 karty
@@ -189,13 +193,13 @@ class UnoGame {
           }
         }
         
-        // Pomiń następnego gracza
-        this.currentPlayerIndex = this.getNextPlayerIndex(nextPlayerDraw2Index);
-        return;
+        // Pomiń gracza, który dobrał karty
+        this.currentPlayerIndex = this.getNextPlayerIndex(nextPlayerIndex);
+        break;
+        
       case 'Wild4':
         // Następny gracz dobiera 4 karty
-        const nextPlayerWild4Index = this.getNextPlayerIndex();
-        const nextPlayerWild4 = this.players[nextPlayerWild4Index];
+        const nextPlayerWild4 = this.players[nextPlayerIndex];
         const nextPlayerWild4Hand = this.playerHands[nextPlayerWild4];
         
         // Dobierz 4 karty
@@ -206,13 +210,17 @@ class UnoGame {
           }
         }
         
-        // Pomiń następnego gracza
-        this.currentPlayerIndex = this.getNextPlayerIndex(nextPlayerWild4Index);
-        return;
+        // Pomiń gracza, który dobrał karty
+        this.currentPlayerIndex = this.getNextPlayerIndex(nextPlayerIndex);
+        break;
+        
+      default:
+        // Dla zwykłych kart, po prostu przejdź do następnego gracza
+        this.currentPlayerIndex = nextPlayerIndex;
+        break;
     }
     
-    // Dla innych kart, przejdź do następnego gracza
-    this.currentPlayerIndex = this.getNextPlayerIndex();
+    console.log(`After playing ${card.value}, current player index: ${this.currentPlayerIndex}`);
   }
 
   getNextPlayerIndex(fromIndex = this.currentPlayerIndex) {
@@ -258,6 +266,8 @@ class UnoGame {
     
     // Przejdź do następnego gracza
     this.currentPlayerIndex = this.getNextPlayerIndex();
+    
+    console.log(`Player ${playerIndex} drew a card. Next player: ${this.currentPlayerIndex}`);
     
     return drawnCard;
   }
