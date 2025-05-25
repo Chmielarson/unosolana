@@ -1,5 +1,6 @@
 // src/components/GameRoom.js
 import React, { useState, useEffect, useCallback } from 'react';
+import ReactDOM from 'react-dom';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { 
   getRoomInfo,
@@ -13,7 +14,9 @@ import {
   endGame,
   autoSkipTurn,
   connectToGameServer,
-  listenForGameState
+  listenForGameState,
+  getSocket,
+  getSocketStatus
 } from '../utils/SolanaTransactions';
 
 // Funkcja do obliczania pozostałego czasu na podstawie turnStartTime
@@ -57,6 +60,94 @@ function GameRoom({ roomId, onBack }) {
   const [unsubscribeGameState, setUnsubscribeGameState] = useState(null);
   const [blockchainGameEnded, setBlockchainGameEnded] = useState(false);
   const [socket, setSocket] = useState(null);
+
+  // Inicjalizuj socket przy montowaniu
+  useEffect(() => {
+    console.log('Initializing socket for GameRoom');
+    const socketInstance = getSocket();
+    setSocket(socketInstance);
+    
+    // Nasłuchuj na połączenie
+    const handleSocketConnect = () => {
+      console.log('Socket connected in GameRoom');
+      setConnectionStatus('connected');
+      // Jeśli już jesteśmy w grze, dołącz ponownie
+      if (roomInfo?.gameStarted && publicKey) {
+        socketInstance.emit('join_game', {
+          roomId,
+          gameId: roomInfo.gameId || 'unknown',
+          playerAddress: publicKey.toString()
+        });
+      }
+    };
+    
+    const handleSocketDisconnect = () => {
+      console.log('Socket disconnected in GameRoom');
+      setConnectionStatus('disconnected');
+    };
+    
+    window.addEventListener('socketConnected', handleSocketConnect);
+    window.addEventListener('socketDisconnected', handleSocketDisconnect);
+    
+    // Sprawdź początkowy status
+    const status = getSocketStatus();
+    if (status.connected) {
+      setConnectionStatus('connected');
+    }
+    
+    return () => {
+      window.removeEventListener('socketConnected', handleSocketConnect);
+      window.removeEventListener('socketDisconnected', handleSocketDisconnect);
+    };
+  }, []);
+
+  // Usprawniona funkcja aktualizacji stanu gry
+  const updateGameState = useCallback((state) => {
+    if (!state) {
+      console.error("Received empty game state");
+      return;
+    }
+    
+    console.log("Updating game state:", {
+      currentPlayer: state.currentPlayerIndex,
+      myIndex: playerIndex,
+      isMyTurn: state.currentPlayerIndex === playerIndex,
+      handSize: state.playerHand?.length,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Użyj React.unstable_batchedUpdates dla lepszej wydajności
+    ReactDOM.unstable_batchedUpdates(() => {
+      setGameState(state);
+      
+      if (state.playerHand) setPlayerHand(state.playerHand);
+      if (state.currentCard) setCurrentCard(state.currentCard);
+      if (state.currentPlayerIndex !== undefined) setCurrentPlayerIndex(state.currentPlayerIndex);
+      if (state.otherPlayersCardCount) setOpponentsCards(state.otherPlayersCardCount);
+      if (state.deckSize !== undefined) setDeckSize(state.deckSize);
+      if (state.direction !== undefined) setDirection(state.direction);
+      if (state.lastAction) setLastAction(state.lastAction);
+      
+      // Automatyczne odświeżenie timera
+      if (state.turnStartTime) {
+        const remaining = calculateRemainingTime(state.turnStartTime, maxTurnTime);
+        setTurnTimer(remaining);
+      }
+      
+      // Sprawdź zwycięzcę
+      if (state.winner && state.winner !== winner) {
+        setWinner(state.winner);
+        if (state.isActive === false) {
+          setGameStatus('ended');
+        }
+      }
+      
+      // Jeśli gra jest nadal aktywna, upewnij się że status to 'playing'
+      if (state.isActive === true && gameStatus !== 'playing' && !blockchainGameEnded) {
+        setGameStatus('playing');
+      }
+    });
+  }, [playerIndex, winner, gameStatus, blockchainGameEnded, maxTurnTime]);
 
   // Funkcja łącząca ładowanie informacji o pokoju i stanie gry z deduplikacją
   const loadRoomAndGameInfo = useCallback(async (force = false) => {
@@ -103,16 +194,8 @@ function GameRoom({ roomId, onBack }) {
           setGameStatus('playing');
           
           // Sprawdź połączenie z serwerem gry
-          if (connectionStatus !== 'connected') {
-            try {
-              setConnectionStatus('connecting');
-              await connectToGameServer(roomId, info.gameId || 'unknown', playerAddr);
-              setConnectionStatus('connected');
-            } catch (connectionError) {
-              console.error("Error connecting to game server:", connectionError);
-              setConnectionStatus('disconnected');
-              setError("Błąd połączenia z serwerem gry. Spróbuj odświeżyć stronę.");
-            }
+          if (connectionStatus !== 'connected' && socket?.connected) {
+            setConnectionStatus('connected');
           }
           
           // Załaduj stan gry
@@ -120,6 +203,7 @@ function GameRoom({ roomId, onBack }) {
             const state = await getGameState(roomId, wallet);
             console.log("Game state loaded:", state);
             updateGameState(state);
+            setIsGameInitialized(true);
           } catch (gameStateError) {
             console.error('Error loading game state:', gameStateError);
             setError("Błąd ładowania stanu gry. Spróbuj odświeżyć.");
@@ -150,7 +234,7 @@ function GameRoom({ roomId, onBack }) {
       setIsRefreshing(false);
       setIsLoading(false);
     }
-  }, [roomId, publicKey, wallet, isLoading, isRefreshing, onBack, lastUpdateTimestamp, connectionStatus]);
+  }, [roomId, publicKey, wallet, isLoading, isRefreshing, onBack, lastUpdateTimestamp, connectionStatus, socket, updateGameState]);
 
   // Efekt inicjalizacyjny - uruchamiany tylko raz przy montowaniu komponentu
   useEffect(() => {
@@ -223,41 +307,89 @@ function GameRoom({ roomId, onBack }) {
     
     loadInitialData();
   }, [roomId, publicKey, wallet, onBack]);
-  
-  // Efekt do nasłuchiwania zmian stanu gry
+
+  // Osobny useEffect dla game listeners z dependencies na socket
   useEffect(() => {
-    if (!roomId || !publicKey || isLoading || !isGameInitialized || connectionStatus !== 'connected') return;
+    if (!socket || !roomId || !publicKey || gameStatus !== 'playing') return;
     
-    console.log("Setting up game state listeners for room:", roomId);
     const playerAddr = publicKey.toString();
     
-    // Czyszczenie poprzedniego nasłuchiwania
-    if (unsubscribeGameState) {
-      unsubscribeGameState();
-    }
+    console.log('Setting up game listeners, socket status:', getSocketStatus());
     
-    // Nasłuchiwanie zmian stanu gry za pomocą Socket.IO
-    const unsubscribe = listenForGameState(roomId, playerAddr, (updatedGameState) => {
-      console.log("Game state updated via socket:", updatedGameState);
+    // Handler dla aktualizacji stanu gry
+    const handleGameStateUpdate = (data) => {
+      console.log('[GameRoom] Game state update received:', {
+        roomId: data.roomId,
+        currentPlayer: data.currentPlayerIndex,
+        lastAction: data.lastAction?.action,
+        timestamp: new Date().toISOString()
+      });
       
-      // Ważne: ustaw timestamp ostatniej aktualizacji
+      // Zawsze aktualizuj stan, nawet dla własnych ruchów
+      // ale oznacz że to własny ruch
+      const isMyAction = data.lastAction?.player === playerAddr;
+      
+      updateGameState(data);
       setLastUpdateTimestamp(Date.now());
       
-      // Aktualizuj stan gry
-      updateGameState(updatedGameState);
+      // Jeśli to nie mój ruch, pokaż wizualny feedback
+      if (!isMyAction && data.lastAction) {
+        // Możesz dodać jakiś efekt dźwiękowy lub animację
+        console.log('Opponent made a move:', data.lastAction.action);
+      }
+    };
+    
+    // Handler dla zakończenia gry
+    const handleGameEnded = (data) => {
+      console.log("Game ended event:", data);
+      setWinner(data.winner);
+      setGameStatus('ended');
+      
+      if (data.blockchainConfirmed) {
+        setBlockchainGameEnded(true);
+      }
+    };
+    
+    // Handler dla must_end_game_on_chain
+    const handleMustEndGame = (data) => {
+      console.log("Must end game on chain:", data);
+      if (data.winnerAddress === playerAddr) {
+        setError("Wygrałeś! Potwierdź zakończenie gry na blockchainie.");
+      }
+    };
+    
+    // Handler dla błędów
+    const handleGameError = (error) => {
+      console.error("Game error:", error);
+      setError(error.message || "Wystąpił błąd w grze");
+    };
+    
+    // Ustaw wszystkie handlery
+    socket.on('game_state_update', handleGameStateUpdate);
+    socket.on('game_state', handleGameStateUpdate); // Dla kompatybilności
+    socket.on('game_ended', handleGameEnded);
+    socket.on('must_end_game_on_chain', handleMustEndGame);
+    socket.on('game_error', handleGameError);
+    
+    // Dołącz do gry
+    console.log('Joining game via socket:', { roomId, playerAddr });
+    socket.emit('join_game', {
+      roomId,
+      gameId: roomInfo?.gameId || 'unknown', 
+      playerAddress: playerAddr
     });
     
-    // Zapisz funkcję anulującą nasłuchiwanie
-    setUnsubscribeGameState(() => unsubscribe);
-    
-    // Funkcja czyszcząca nasłuchiwacze
+    // Cleanup
     return () => {
-      if (unsubscribe) unsubscribe();
+      console.log('Cleaning up game listeners');
+      socket.off('game_state_update', handleGameStateUpdate);
+      socket.off('game_state', handleGameStateUpdate);
+      socket.off('game_ended', handleGameEnded);
+      socket.off('must_end_game_on_chain', handleMustEndGame);
+      socket.off('game_error', handleGameError);
+      socket.emit('leave_game', { roomId, playerAddress: playerAddr });
     };
-  }, [roomId, publicKey, isLoading, isGameInitialized, connectionStatus]);
-
-  // Handler dla wydarzenia must_end_game_on_chain
-
+  }, [socket, roomId, publicKey, gameStatus, roomInfo?.gameId, updateGameState]);
 
   // Efekt do odliczania czasu dla aktualnego gracza
   useEffect(() => {
@@ -404,53 +536,7 @@ function GameRoom({ roomId, onBack }) {
       console.log("Cleaning up backup refresh");
       clearInterval(interval);
     };
-  }, [roomId, wallet, gameStatus, connectionStatus, blockchainGameEnded]);
-
-  // Usprawniona funkcja aktualizacji stanu gry
-  const updateGameState = (state) => {
-    if (!state) {
-      console.error("Received empty game state");
-      return;
-    }
-    
-    console.log("Updating game state with:", {
-      hasHand: !!state.playerHand && state.playerHand.length > 0,
-      hasCurrentCard: !!state.currentCard,
-      currentPlayer: state.currentPlayerIndex,
-      deckSize: state.deckSize,
-      turnStartTime: state.turnStartTime,
-      winner: state.winner,
-      isActive: state.isActive,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Zaktualizuj stan gry w pojedynczym batchu, aby uniknąć wielu re-renderów
-    setGameState(state);
-    
-    // Natychmiastowo aktualizuj widoczne komponenty
-    if (state.playerHand) setPlayerHand(state.playerHand);
-    if (state.currentCard) setCurrentCard(state.currentCard);
-    if (state.currentPlayerIndex !== undefined) setCurrentPlayerIndex(state.currentPlayerIndex);
-    if (state.otherPlayersCardCount) setOpponentsCards(state.otherPlayersCardCount);
-    if (state.deckSize !== undefined) setDeckSize(state.deckSize);
-    if (state.direction !== undefined) setDirection(state.direction);
-    if (state.lastAction) setLastAction(state.lastAction);
-    
-    // WAŻNE: Sprawdź stan gry na podstawie danych z serwera
-    if (state.winner && state.winner !== winner) {
-      setWinner(state.winner);
-      // Tylko ustaw 'ended' jeśli gra rzeczywiście się zakończyła
-      if (state.isActive === false) {
-        setGameStatus('ended');
-        // Nie ustawiaj blockchainGameEnded tutaj - czekaj na potwierdzenie
-      }
-    }
-    
-    // Jeśli gra jest nadal aktywna, upewnij się że status to 'playing'
-    if (state.isActive === true && gameStatus !== 'playing' && !blockchainGameEnded) {
-      setGameStatus('playing');
-    }
-  };
+  }, [roomId, wallet, gameStatus, connectionStatus, blockchainGameEnded, updateGameState]);
 
   // Dołączenie do pokoju
   const handleJoinRoom = async () => {
@@ -888,7 +974,7 @@ function GameRoom({ roomId, onBack }) {
     const isCurrentPlayer = index === currentPlayerIndex;
     
     return (
-      <div className="opponent" key={index}>
+      <div className={`opponent ${isCurrentPlayer ? 'is-current-player' : ''}`} key={index}>
         <div className="opponent-name">
           Gracz {index + 1}
           {isCurrentPlayer && (
@@ -955,40 +1041,12 @@ function GameRoom({ roomId, onBack }) {
   const renderConnectionStatus = () => {
     if (gameStatus !== 'playing') return null;
     
-    switch (connectionStatus) {
-      case 'connected':
-        return <div className="connection-status connected">Połączono z serwerem gry</div>;
-      case 'connecting':
-        return <div className="connection-status connecting">Łączenie z serwerem gry...</div>;
-      case 'disconnected':
-        return (
-          <div className="connection-status disconnected">
-            Brak połączenia z serwerem
-            <button 
-              className="reconnect-btn"
-              onClick={() => {
-                if (publicKey && roomInfo?.gameId) {
-                  setConnectionStatus('connecting');
-                  connectToGameServer(roomId, roomInfo.gameId, publicKey.toString())
-                    .then(() => {
-                      setConnectionStatus('connected');
-                      loadRoomAndGameInfo(true);
-                    })
-                    .catch(error => {
-                      console.error("Error reconnecting:", error);
-                      setConnectionStatus('disconnected');
-                      setError("Błąd połączenia z serwerem gry");
-                    });
-                }
-              }}
-            >
-              Połącz ponownie
-            </button>
-          </div>
-        );
-      default:
-        return null;
-    }
+    return (
+      <div className={`socket-status ${connectionStatus}`}>
+        {connectionStatus === 'connected' ? 'Połączono' : 
+         connectionStatus === 'connecting' ? 'Łączenie...' : 'Rozłączono'}
+      </div>
+    );
   };
 
   if (isLoading && !roomInfo) {
@@ -1036,6 +1094,7 @@ function GameRoom({ roomId, onBack }) {
           <div>connectionStatus: {connectionStatus}</div>
           <div>playerHand length: {playerHand?.length || 0}</div>
           <div>roomInfo.blockchainEnded: {roomInfo?.blockchainEnded?.toString() || 'unknown'}</div>
+          <div>socket connected: {socket?.connected?.toString() || 'no socket'}</div>
         </div>
       )}
       
@@ -1155,7 +1214,7 @@ function GameRoom({ roomId, onBack }) {
           <div className="game-area">
             {/* Talia */}
             <div 
-              className="deck" 
+              className={`deck ${currentPlayerIndex !== playerIndex && gameStatus === 'playing' ? 'opponent-drawing' : ''}`}
               onClick={currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' && !blockchainGameEnded ? handleDrawCard : undefined}
               style={{ 
                 cursor: currentPlayerIndex === playerIndex && gameStatus === 'playing' && connectionStatus === 'connected' && !blockchainGameEnded
@@ -1170,7 +1229,7 @@ function GameRoom({ roomId, onBack }) {
             
             {/* Aktualna karta */}
             {currentCard ? (
-              <div className="current-card">
+              <div className={`current-card ${lastAction?.action === 'play' ? 'just-played' : ''}`}>
                 <div className={`uno-card ${currentCard.color}`}>
                   {currentCard.value}
                 </div>

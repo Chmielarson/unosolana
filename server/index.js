@@ -184,45 +184,30 @@ io.on('connection', (socket) => {
   
   // Obsługa dołączania do gry
   socket.on('join_game', ({ roomId, gameId, playerAddress }) => {
-    console.log(`Player ${playerAddress} joining game room: ${roomId}, game ID: ${gameId}`);
-    
-    // Dołącz do pokoju Socket.IO
-    socket.join(roomId);
-    socket.data.roomId = roomId;
-    socket.data.playerAddress = playerAddress;
-    
-    // Sprawdź, czy gra już istnieje
-    let game = gameStates.get(roomId);
-    
-    if (!game) {
-      // Jeśli nie istnieje, sprawdź, czy mamy dane o pokoju
-      const room = activeRooms.get(roomId);
-      
-      if (room && room.players && room.players.length >= 2) {
-        // Utwórz nową grę
-        game = new UnoGame(roomId, room.players);
-        gameStates.set(roomId, game);
-        console.log(`New game created for room ${roomId} with ${room.players.length} players`);
-      } else {
-        console.log(`Unable to start game for room ${roomId}: insufficient players or room data`);
-        socket.emit('error', { message: "Niewystarczająca liczba graczy lub brak danych pokoju" });
-        return;
-      }
-    }
-    
-    // Dodaj gracza do subskrypcji stanu gry
-    const subscriptionKey = `${roomId}-${playerAddress}`;
-    gameStateSubscriptions.set(subscriptionKey, socket.id);
-    
-    // Wyślij aktualny stan gry do gracza
+  console.log(`Player ${playerAddress} joining game room: ${roomId}`);
+  
+  // WAŻNE: Dołącz do pokoju Socket.IO używając roomId jako nazwy pokoju
+  socket.join(roomId);
+  socket.data.roomId = roomId;
+  socket.data.playerAddress = playerAddress;
+  
+  // Zapisz socket ID dla tego gracza
+  const subscriptionKey = `${roomId}-${playerAddress}`;
+  gameStateSubscriptions.set(subscriptionKey, socket.id);
+  
+  console.log(`Player ${playerAddress} joined room ${roomId}, socket: ${socket.id}`);
+  
+  // Natychmiast wyślij aktualny stan gry
+  const game = gameStates.get(roomId);
+  if (game) {
     const gameState = game.getGameStateForPlayer(playerAddress);
     socket.emit('game_state', { gameState, requestId: Date.now().toString() });
-    
-    // Potwierdź dołączenie do pokoju
-    socket.emit('join_game_confirm', { roomId, playerAddress });
-    
-    console.log(`Player ${playerAddress} joined game room ${roomId}`);
-  });
+    console.log(`Sent initial game state to ${playerAddress}`);
+  }
+  
+  // Potwierdź dołączenie
+  socket.emit('join_game_confirm', { roomId, playerAddress });
+});
   
   // Obsługa opuszczania gry
   socket.on('leave_game', ({ roomId, playerAddress }) => {
@@ -282,117 +267,62 @@ io.on('connection', (socket) => {
   
   // Obsługa zagrania karty
   socket.on('play_card', ({ roomId, playerAddress, cardIndex, chosenColor, requestId }) => {
-    console.log(`Play card request from ${playerAddress}: room=${roomId}, card=${cardIndex}, color=${chosenColor}`);
+  console.log(`Play card: room=${roomId}, player=${playerAddress}, card=${cardIndex}`);
+  
+  const game = gameStates.get(roomId);
+  if (!game) {
+    socket.emit('play_card_result', { error: "Game not found", requestId });
+    return;
+  }
+  
+  try {
+    const result = game.playCard(playerAddress, cardIndex, chosenColor);
     
-    const game = gameStates.get(roomId);
+    // Natychmiast wyślij wynik do gracza
+    socket.emit('play_card_result', { ...result, requestId });
     
-    if (!game) {
-      socket.emit('play_card_result', { 
-        error: "Game not found", 
-        requestId 
-      });
-      return;
-    }
+    // WAŻNE: Natychmiast rozgłoś stan gry do WSZYSTKICH graczy
+    console.log("Broadcasting game state after play_card");
+    broadcastGameState(roomId, game);
     
-    try {
-      // Wykonaj ruch
-      const result = game.playCard(playerAddress, cardIndex, chosenColor);
-      
-      // Wyślij wynik do gracza
-      socket.emit('play_card_result', { 
-        ...result, 
-        requestId 
-      });
-      
-      // Wyślij aktualizację stanu gry do wszystkich graczy
-      broadcastGameState(roomId, game);
-      
-      // Jeśli ktoś wygrał, aktualizuj dane pokoju i zakończ grę
-      if (result.winner) {
-        const room = activeRooms.get(roomId);
-        if (room) {
-          room.winner = playerAddress;
-          room.isActive = false;
-          room.endedAt = new Date().toISOString();
-          room.lastActivity = new Date().toISOString();
-          
-          // Znajdź socket ID zwycięzcy
-          const winnerSubscriptionKey = `${roomId}-${playerAddress}`;
-          const winnerSocketId = gameStateSubscriptions.get(winnerSubscriptionKey);
-          
-          // Powiadom zwycięzcę, że musi wywołać endGame na blockchainie
-          if (winnerSocketId) {
-            io.to(winnerSocketId).emit('must_end_game_on_chain', {
-              roomId,
-              winnerAddress: playerAddress,
-              message: "You won! Please confirm the game end on blockchain."
-            });
-          }
-          
-          // Powiadom wszystkich o oczekiwaniu na blockchain
-          io.to(roomId).emit('game_ending', { 
-            winner: playerAddress,
-            waitingForBlockchain: true 
-          });
-          
-          // Aktualizuj dane w pamięci
-          activeRooms.set(roomId, room);
-          
-          // Ustaw timeout - jeśli po 30 sekundach gra nie została zakończona na blockchainie
-          setTimeout(() => {
-            const currentRoom = activeRooms.get(roomId);
-            if (currentRoom && !currentRoom.blockchainEnded) {
-              console.warn(`Game ${roomId} not ended on blockchain after 30s`);
-              io.to(roomId).emit('blockchain_timeout', {
-                message: "Game end confirmation timeout. You can try claiming prize manually."
-              });
-            }
-          }, 30000);
-        }
-      }
-    } catch (error) {
-      console.error(`Error playing card in room ${roomId}:`, error);
-      socket.emit('play_card_result', { 
-        error: error.message, 
-        requestId 
+    // Jeśli ktoś wygrał...
+    if (result.winner) {
+      // Broadcast do wszystkich o wygranej
+      io.to(roomId).emit('game_ending', { 
+        winner: playerAddress,
+        waitingForBlockchain: true 
       });
     }
-  });
+  } catch (error) {
+    console.error(`Error playing card:`, error);
+    socket.emit('play_card_result', { error: error.message, requestId });
+  }
+});
   
   // Obsługa dobierania karty
   socket.on('draw_card', ({ roomId, playerAddress, requestId }) => {
-    console.log(`Draw card request from ${playerAddress}: room=${roomId}`);
+  console.log(`Draw card: room=${roomId}, player=${playerAddress}`);
+  
+  const game = gameStates.get(roomId);
+  if (!game) {
+    socket.emit('draw_card_result', { error: "Game not found", requestId });
+    return;
+  }
+  
+  try {
+    const card = game.drawCard(playerAddress);
     
-    const game = gameStates.get(roomId);
+    // Wyślij wynik
+    socket.emit('draw_card_result', { card, requestId });
     
-    if (!game) {
-      socket.emit('draw_card_result', { 
-        error: "Game not found", 
-        requestId 
-      });
-      return;
-    }
-    
-    try {
-      // Wykonaj dobieranie karty
-      const card = game.drawCard(playerAddress);
-      
-      // Wyślij wynik do gracza
-      socket.emit('draw_card_result', { 
-        card, 
-        requestId 
-      });
-      
-      // Wyślij aktualizację stanu gry do wszystkich graczy
-      broadcastGameState(roomId, game);
-    } catch (error) {
-      console.error(`Error drawing card in room ${roomId}:`, error);
-      socket.emit('draw_card_result', { 
-        error: error.message, 
-        requestId 
-      });
-    }
-  });
+    // WAŻNE: Natychmiast rozgłoś stan gry
+    console.log("Broadcasting game state after draw_card");
+    broadcastGameState(roomId, game);
+  } catch (error) {
+    console.error(`Error drawing card:`, error);
+    socket.emit('draw_card_result', { error: error.message, requestId });
+  }
+});
   
   // Obsługa rozłączenia
   socket.on('disconnect', () => {
@@ -417,6 +347,8 @@ function broadcastGameState(roomId, game) {
     return;
   }
   
+  console.log(`Broadcasting game state to ${room.players.length} players in room ${roomId}`);
+  
   // Pobierz bazowy stan gry
   const baseState = game.getGameState();
   
@@ -427,19 +359,25 @@ function broadcastGameState(roomId, game) {
       const subscriptionKey = `${roomId}-${playerAddress}`;
       const socketId = gameStateSubscriptions.get(subscriptionKey);
       
-      if (socketId) {
-        // Pobierz stan gry z perspektywy gracza
-        const playerState = game.getGameStateForPlayer(playerAddress);
-        
-        // Wyślij stan gry do gracza
+      // Pobierz stan gry z perspektywy gracza
+      const playerState = game.getGameStateForPlayer(playerAddress);
+      
+      console.log(`Sending update to player ${playerAddress}, socketId: ${socketId}`);
+      
+      if (socketId && io.sockets.sockets.get(socketId)) {
+        // Wyślij bezpośrednio do socket ID
         io.to(socketId).emit('game_state_update', playerState);
+      } else {
+        // Fallback - wyślij do wszystkich w pokoju
+        console.log(`Socket not found for player ${playerAddress}, broadcasting to room`);
+        io.to(roomId).emit('game_state_update', playerState);
       }
     } catch (error) {
-      console.error(`Error broadcasting to player ${playerAddress} in room ${roomId}:`, error);
+      console.error(`Error broadcasting to player ${playerAddress}:`, error);
     }
   }
   
-  console.log(`Broadcasted game state to all players in room ${roomId}`);
+  console.log(`Game state broadcast completed for room ${roomId}`);
 }
 
 // Rozpocznij nasłuchiwanie na wskazanym porcie

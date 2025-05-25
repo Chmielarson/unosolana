@@ -19,7 +19,7 @@ const connection = new Connection(clusterApiUrl(NETWORK), 'confirmed');
 const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://localhost:3001';
 
 // Adres programu Solana (smart contract)
-const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'CtG9Ay5MZcn77ye3FrCKyd5FaBh4F7e8oBGe8GJsLCq');
+const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'E3Am45cxhcUSanKtqrLW9kSpE3M2U674RjTsidb6yYNj');
 
 // Stałe dla Solana
 const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
@@ -182,44 +182,70 @@ async function findGamePDA(creatorPubkey, roomSlot = 0) {
 
 // Inicjalizacja i zarządzanie Socket.IO
 function initializeSocket() {
-  if (socket) {
-    // Jeśli socket już istnieje, ale jest rozłączony, spróbuj ponownie połączyć
-    if (!socket.connected) {
-      socket.connect();
-    }
+  if (socket && socket.connected) {
+    console.log('Socket already connected');
     return socket;
   }
   
-  // Inicjalizuj nowy socket
-  socket = io(GAME_SERVER_URL, {
-    reconnection: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000,
-    timeout: 10000,
-    autoConnect: true
-  });
-  
-  // Ustaw handlery zdarzeń
-  socket.on('connect', () => {
-    console.log('Connected to game server:', socket.id);
-    socketConnected = true;
+  if (!socket) {
+    console.log('Creating new socket connection to:', GAME_SERVER_URL);
+    socket = io(GAME_SERVER_URL, {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 10000,
+      autoConnect: true,
+      transports: ['websocket', 'polling'] // Dodaj transport options
+    });
     
-    // Ponownie subskrybuj wszystkie pokoje i stany gier
-    recheckSubscriptions();
-  });
+    // Globalne handlery
+    socket.on('connect', () => {
+      console.log('✅ Connected to game server:', socket.id);
+      socketConnected = true;
+      
+      // Emit custom event dla komponentów
+      window.dispatchEvent(new CustomEvent('socketConnected', { detail: { socketId: socket.id } }));
+    });
+    
+    socket.on('disconnect', (reason) => {
+      console.log('❌ Disconnected from game server:', reason);
+      socketConnected = false;
+      
+      window.dispatchEvent(new CustomEvent('socketDisconnected', { detail: { reason } }));
+    });
+    
+    socket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+    });
+    
+    socket.on('reconnect', (attemptNumber) => {
+      console.log('Reconnected after', attemptNumber, 'attempts');
+      recheckSubscriptions();
+    });
+  }
   
-  socket.on('disconnect', (reason) => {
-    console.log('Disconnected from game server:', reason);
-    socketConnected = false;
-  });
+  // Jeśli socket istnieje ale nie jest połączony, połącz
+  if (!socket.connected) {
+    console.log('Connecting socket...');
+    socket.connect();
+  }
   
-  socket.on('error', (error) => {
-    console.error('Socket.IO error:', error);
-  });
-  
-  // Zwróć socket
   return socket;
+}
+
+// Dodaj funkcję pomocniczą do sprawdzenia stanu socket
+export function getSocketStatus() {
+  return {
+    exists: !!socket,
+    connected: socket?.connected || false,
+    id: socket?.id || null
+  };
+}
+
+// Eksportuj socket dla komponentów
+export function getSocket() {
+  return initializeSocket();
 }
 
 // Ponowna subskrypcja wszystkich pokojów i stanów gier
