@@ -833,7 +833,7 @@ function GameRoom({ roomId, onBack }) {
     }
   };
 
-  // Odebranie nagrody
+  // Odebranie nagrody z prowizją 5%
   const handleClaimPrize = async () => {
     if (gameStatus !== 'ended' || winner !== publicKey?.toString() || !blockchainGameEnded) {
       // Tylko zwycięzca może odebrać nagrodę po zakończeniu gry na blockchainie
@@ -868,7 +868,16 @@ function GameRoom({ roomId, onBack }) {
       setIsLoading(true);
       setError(null);
       const result = await claimPrize(roomId, wallet);
-      alert(`Gratulacje! Nagroda w wysokości ${result.prize} SOL została przesłana do Twojego portfela.`);
+      
+      // Wyświetl szczegółowe informacje o nagrodzie
+      alert(
+        `🎉 Gratulacje! Wygrałeś!\n\n` +
+        `💰 Całkowita pula: ${result.totalPrize.toFixed(2)} SOL\n` +
+        `🏆 Twoja nagroda (95%): ${result.prize.toFixed(2)} SOL\n` +
+        `🏛️ Prowizja platformy (5%): ${result.platformFee.toFixed(2)} SOL\n\n` +
+        `Nagroda została przesłana do Twojego portfela!`
+      );
+      
       onBack(); // Wróć do listy pokojów po odebraniu nagrody
     } catch (error) {
       console.error('Error claiming prize:', error);
@@ -1295,7 +1304,10 @@ function GameRoom({ roomId, onBack }) {
                   onClick={handleClaimPrize}
                   disabled={isLoading}
                 >
-                  {isLoading ? 'Odbieranie...' : `Odbierz nagrodę (${roomInfo?.entryFee * roomInfo?.currentPlayers} SOL)`}
+                  {isLoading 
+                    ? 'Odbieranie...' 
+                    : `Odbierz nagrodę (${(roomInfo?.entryFee * roomInfo?.currentPlayers * 0.95).toFixed(2)} SOL)`
+                  }
                 </button>
               )}
               

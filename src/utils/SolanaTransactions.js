@@ -19,7 +19,7 @@ const connection = new Connection(clusterApiUrl(NETWORK), 'confirmed');
 const GAME_SERVER_URL = process.env.REACT_APP_GAME_SERVER_URL || 'http://localhost:3001';
 
 // Adres programu Solana (smart contract)
-const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'E3Am45cxhcUSanKtqrLW9kSpE3M2U674RjTsidb6yYNj');
+const PROGRAM_ID = new PublicKey(process.env.REACT_APP_PROGRAM_ID || 'BD1JLkPHrmER2GUDvYM4c53BT7itW2VcPhXnhBQgHDCF');
 
 // Stałe dla Solana
 const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
@@ -930,6 +930,12 @@ export async function endGame(roomId, winnerAddress, wallet) {
 }
 
 // Funkcja do odebrania nagrody przez zwycięzcę
+// W SolanaTransactions.js, zaktualizuj funkcję claimPrize:
+
+// WAŻNE: Ustaw adres portfela platformy (ten sam co w programie Rust)
+const PLATFORM_FEE_WALLET = new PublicKey('FEEfBE29dqRgC8qMv6f9YXTSNbX7LMN3Reo3UsYdoUd8');
+
+// Funkcja do odebrania nagrody przez zwycięzcę (z 5% prowizją dla platformy)
 export async function claimPrize(roomId, wallet) {
   console.log("Claiming prize for room:", roomId);
   
@@ -961,29 +967,41 @@ export async function claimPrize(roomId, wallet) {
     // 4. Pobierz adres PDA pokoju
     const roomPDA = new PublicKey(roomData.roomAddress);
     
-    // 5. Serializuj dane instrukcji
+    // 5. Oblicz nagrody
+    const totalPrize = roomData.entryFee * roomData.players.length;
+    const platformFee = totalPrize * 0.05; // 5% prowizji
+    const winnerPrize = totalPrize * 0.95; // 95% dla zwycięzcy
+    
+    console.log("Prize distribution:", {
+      total: totalPrize,
+      platformFee: platformFee,
+      winnerPrize: winnerPrize
+    });
+    
+    // 6. Serializuj dane instrukcji
     const data = serializeClaimPrizeData();
     
-    // 6. Utwórz instrukcję
+    // 7. Utwórz instrukcję z dodatkowym kontem dla prowizji
     const instruction = new TransactionInstruction({
       keys: [
         { pubkey: publicKey, isSigner: true, isWritable: true },
         { pubkey: roomPDA, isSigner: false, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: PLATFORM_FEE_WALLET, isSigner: false, isWritable: true }, // NOWE: Konto prowizji
       ],
       programId: PROGRAM_ID,
       data: data
     });
     
-    // 7. Utwórz transakcję
+    // 8. Utwórz transakcję
     const transaction = new Transaction().add(instruction);
     
-    // 8. Pobierz ostatni blok
+    // 9. Pobierz ostatni blok
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = publicKey;
     
-    // 9. Podpisz transakcję
+    // 10. Podpisz transakcję
     let signedTransaction;
     try {
       signedTransaction = await signTransaction(transaction);
@@ -991,10 +1009,10 @@ export async function claimPrize(roomId, wallet) {
       throw new Error(`Błąd podpisu: ${signError.message}`);
     }
     
-    // 10. Wyślij transakcję
+    // 11. Wyślij transakcję
     const signature = await connection.sendRawTransaction(signedTransaction.serialize());
     
-    // 11. Poczekaj na potwierdzenie
+    // 12. Poczekaj na potwierdzenie
     await connection.confirmTransaction({
       blockhash,
       lastValidBlockHeight,
@@ -1003,7 +1021,7 @@ export async function claimPrize(roomId, wallet) {
     
     console.log("Claim prize transaction confirmed:", signature);
     
-    // 12. Powiadom serwer o odebraniu nagrody
+    // 13. Powiadom serwer o odebraniu nagrody
     const claimResult = await retryFetch(`${GAME_SERVER_URL}/api/rooms/${roomId}/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1013,12 +1031,17 @@ export async function claimPrize(roomId, wallet) {
       }),
     });
     
-    const prize = roomData.entryFee * roomData.players.length;
+    console.log("Prize claimed successfully:", {
+      totalPrize: totalPrize + " SOL",
+      platformFee: platformFee + " SOL",
+      winnerPrize: winnerPrize + " SOL"
+    });
     
-    console.log("Prize claimed successfully:", prize, "SOL");
     return {
       winner: publicKey.toString(),
-      prize,
+      prize: winnerPrize, // Zwracamy kwotę faktycznie otrzymaną przez gracza
+      platformFee: platformFee,
+      totalPrize: totalPrize,
       claimedAt: new Date().toISOString()
     };
   } catch (error) {

@@ -12,6 +12,7 @@ use solana_program::{
     sysvar::{rent::Rent, Sysvar, clock::Clock},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::str::FromStr;
 
 /// Definicja stanów gry
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq)]
@@ -179,6 +180,7 @@ pub enum UnoInstruction {
     /// 1. `[signer]` Zwycięzca odbierający nagrodę
     /// 2. `[writable]` PDA dla danych pokoju
     /// 3. `[]` System program
+    /// 4. `[writable]` Portfel platformy dla prowizji
     ClaimPrize,
     
     /// Anuluje pokój i zwraca wpisowe wszystkim graczom
@@ -537,7 +539,6 @@ fn process_end_game(
 }
 
 /// Implementacja odbierania nagrody
-/// Implementacja odbierania nagrody
 fn process_claim_prize(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -547,9 +548,21 @@ fn process_claim_prize(
     let winner_account = next_account_info(accounts_iter)?;
     let game_account = next_account_info(accounts_iter)?;
     let _system_program = next_account_info(accounts_iter)?;
+    let platform_fee_account = next_account_info(accounts_iter)?; // NOWE: Konto dla prowizji platformy
     
     msg!("Claim prize - Winner account: {}", winner_account.key);
     msg!("Claim prize - Game account: {}", game_account.key);
+    msg!("Claim prize - Platform fee account: {}", platform_fee_account.key);
+    
+    // STAŁY ADRES PORTFELA PLATFORMY - ZMIEŃ NA SWÓJ!
+    const PLATFORM_WALLET: &str = "FEEfBE29dqRgC8qMv6f9YXTSNbX7LMN3Reo3UsYdoUd8";
+    let platform_pubkey = Pubkey::from_str(PLATFORM_WALLET).unwrap_or_default();
+    
+    // Weryfikacja, że podano prawidłowy adres platformy
+    if *platform_fee_account.key != platform_pubkey {
+        msg!("Error: Invalid platform fee account");
+        return Err(ProgramError::InvalidArgument);
+    }
     
     // Weryfikacja podpisu
     if !winner_account.is_signer {
@@ -589,9 +602,16 @@ fn process_claim_prize(
         return Err(ProgramError::InvalidAccountData);
     }
     
-    // Obliczenie nagrody (suma wszystkich wpisowych)
-    let prize = game_room.entry_fee_lamports * game_room.players.len() as u64;
-    msg!("Prize amount: {} lamports", prize);
+    // Obliczenie całkowitej puli
+    let total_prize = game_room.entry_fee_lamports * game_room.players.len() as u64;
+    msg!("Total prize pool: {} lamports", total_prize);
+    
+    // Obliczenie prowizji platformy (5%)
+    let platform_fee = total_prize * 5 / 100; // 5% prowizji
+    let winner_prize = total_prize - platform_fee;
+    
+    msg!("Platform fee (5%): {} lamports", platform_fee);
+    msg!("Winner prize (95%): {} lamports", winner_prize);
     
     // Sprawdź czy konto ma wystarczające środki
     let rent = Rent::get()?;
@@ -600,35 +620,27 @@ fn process_claim_prize(
     
     msg!("Game account balance: {} lamports", game_account.lamports());
     msg!("Rent exempt balance: {} lamports", rent_exempt_balance);
-    msg!("Available for prize: {} lamports", available_balance);
+    msg!("Available for distribution: {} lamports", available_balance);
     
-    if available_balance < prize {
+    if available_balance < total_prize {
         msg!("Error: Insufficient funds in game account. Available: {}, needs: {}", 
-            available_balance, prize);
+            available_balance, total_prize);
         return Err(ProgramError::InsufficientFunds);
     }
     
-    // Sprawdź, czy po transferze zostanie wystarczająco na rent
-    let remaining_balance = game_account.lamports().saturating_sub(prize);
-    if remaining_balance < rent_exempt_balance {
-        msg!("Error: Transfer would leave account below rent-exempt threshold");
-        // Transfer tylko dostępnej kwoty
-        let transferable_amount = available_balance;
-        msg!("Adjusting prize to maximum transferable amount: {} lamports", transferable_amount);
-        
-        // Bezpośredni transfer lamportów
-        **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(transferable_amount);
-        **winner_account.try_borrow_mut_lamports()? = winner_account.lamports().saturating_add(transferable_amount);
-    } else {
-        // Normalny transfer pełnej nagrody
-        msg!("Transferring full prize to winner");
-        
-        // Bezpośredni transfer lamportów
-        **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(prize);
-        **winner_account.try_borrow_mut_lamports()? = winner_account.lamports().saturating_add(prize);
+    // Transfer prowizji do portfela platformy
+    if platform_fee > 0 {
+        msg!("Transferring platform fee: {} lamports", platform_fee);
+        **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(platform_fee);
+        **platform_fee_account.try_borrow_mut_lamports()? = platform_fee_account.lamports().saturating_add(platform_fee);
     }
     
-    msg!("Prize transferred successfully");
+    // Transfer nagrody do zwycięzcy
+    msg!("Transferring winner prize: {} lamports", winner_prize);
+    **game_account.try_borrow_mut_lamports()? = game_account.lamports().saturating_sub(winner_prize);
+    **winner_account.try_borrow_mut_lamports()? = winner_account.lamports().saturating_add(winner_prize);
+    
+    msg!("All transfers completed successfully");
     
     // Oznaczenie nagrody jako odebranej
     game_room.prize_claimed = true;
@@ -636,7 +648,7 @@ fn process_claim_prize(
     // Zapisanie zaktualizowanych danych
     game_room.to_account_data(&mut game_account.data.borrow_mut())?;
     
-    msg!("Nagroda odebrana");
+    msg!("Prize claimed. Platform fee: {} lamports, Winner prize: {} lamports", platform_fee, winner_prize);
     Ok(())
 }
 
